@@ -137,6 +137,17 @@ def tf_rotation_matrix_from_axis_angle(axis: jnp.ndarray, angle: float) -> jnp.n
     return R4
 
 
+# How a controlled bone's 3 parameters are interpreted, see _compute_fk_tf
+JOINT_EULER = 0
+JOINT_REVOLUTE = 1
+JOINT_PRISMATIC = 2
+_JOINT_MODES = {
+    "revolute": JOINT_REVOLUTE,
+    "continuous": JOINT_REVOLUTE,
+    "prismatic": JOINT_PRISMATIC,
+}
+
+
 @partial(jax.jit, static_argnums=(3, 5))
 def _compute_fk_tf(
     local_array: jnp.ndarray,
@@ -145,7 +156,7 @@ def _compute_fk_tf(
     controlled_indices: tuple,
     angle_vector: jnp.ndarray,
     level_bounds: tuple,
-    prismatic_mask: jnp.ndarray = None,
+    joint_mode: jnp.ndarray = None,
     joint_axes: jnp.ndarray = None,
     mimic: tuple = None,
 ) -> jnp.ndarray:
@@ -171,15 +182,16 @@ def _compute_fk_tf(
         angle_vector (jnp.ndarray): Euler angles for controlled bones (K*3,).
         level_bounds (tuple): Static tuple of (start, end) slices, one per depth
             level, into the level-sorted arrays above.
-        prismatic_mask (jnp.ndarray): Optional (K,) bool, True for controlled
-            bones driven by a prismatic joint. For those, the first of the
-            bone's 3 parameters is a displacement (meters) along joint_axes
-            instead of an Euler angle; the other two are ignored.
+        joint_mode (jnp.ndarray): Optional (K,) int per controlled bone:
+            JOINT_EULER (3 free Euler angles), JOINT_REVOLUTE (first parameter
+            is an angle about joint_axes) or JOINT_PRISMATIC (first parameter
+            is a displacement in meters along joint_axes). For the 1-DOF modes
+            the other two parameters are ignored.
         joint_axes (jnp.ndarray): Optional (K, 3) unit joint axes, required
-            together with prismatic_mask.
+            together with joint_mode.
         mimic (tuple): Optional URDF mimic joints as arrays of length M:
-            (bone_idx, master_slot, master_component, master_sign, multiplier,
-            offset, axis (M, 3), is_prismatic). Each mimic bone's transform is
+            (bone_idx, master_slot, multiplier, offset, axis (M, 3),
+            is_prismatic). Each mimic bone's transform is
             fully derived from its master joint's value (master_slot -1 means
             the master is not controlled, i.e. at 0), overriding any
             parameters of its own.
@@ -194,22 +206,26 @@ def _compute_fk_tf(
     params = angle_vector.reshape(num_controlled, 3)
     R_updates = jax.vmap(tf_euler_to_matrix)(params)
 
-    if prismatic_mask is not None:
+    if joint_mode is not None:
+        A_updates = jax.vmap(tf_rotation_matrix_from_axis_angle)(
+            joint_axes, params[:, 0]
+        )
         T_updates = jnp.broadcast_to(
             jnp.eye(4, dtype=jnp.float32), (num_controlled, 4, 4)
         )
         T_updates = T_updates.at[:, :3, 3].set(params[:, :1] * joint_axes)
-        R_updates = jnp.where(prismatic_mask[:, None, None], T_updates, R_updates)
+        mode = joint_mode[:, None, None]
+        R_updates = jnp.where(mode == JOINT_REVOLUTE, A_updates, R_updates)
+        R_updates = jnp.where(mode == JOINT_PRISMATIC, T_updates, R_updates)
 
     rotations = default_rotations.at[ctrl_idx_arr].set(R_updates)
 
     if mimic is not None:
-        (m_idx, m_slot, m_comp, m_sign, m_mult, m_offset, m_axis, m_prismatic) = mimic
-        master_val = jnp.where(
-            m_slot >= 0,
-            params[jnp.maximum(m_slot, 0), m_comp] * m_sign,
-            0.0,
-        )
+        (m_idx, m_slot, m_mult, m_offset, m_axis, m_prismatic) = mimic
+        if num_controlled:
+            master_val = jnp.where(m_slot >= 0, params[jnp.maximum(m_slot, 0), 0], 0.0)
+        else:
+            master_val = jnp.zeros_like(m_mult)
         value = m_mult * master_val + m_offset
         M_rot = jax.vmap(tf_rotation_matrix_from_axis_angle)(m_axis, value)
         M_trans = jnp.broadcast_to(jnp.eye(4, dtype=jnp.float32), M_rot.shape)
@@ -818,14 +834,17 @@ class FKSolver:
         self.default_rotations = jnp.stack(
             [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
         )
-        # Controlled bones driven by URDF prismatic joints slide instead of
-        # rotating (see _compute_fk_tf)
-        prismatic = [
-            self.skeleton[self.bone_names[i]].get("joint_type") == "prismatic"
+        # URDF revolute/prismatic joints have a single degree of freedom
+        # about/along their axis (see _compute_fk_tf); everything else, e.g.
+        # GLTF bones, keeps 3 free Euler angles
+        modes = [
+            _JOINT_MODES.get(
+                self.skeleton[self.bone_names[i]].get("joint_type"), JOINT_EULER
+            )
             for i in self.controlled_indices
         ]
-        if any(prismatic):
-            self.prismatic_mask = jnp.asarray(prismatic, dtype=bool)
+        if any(m != JOINT_EULER for m in modes):
+            self.joint_mode = jnp.asarray(modes, dtype=jnp.int32)
             self.joint_axes = jnp.asarray(
                 np.stack(
                     [
@@ -838,7 +857,7 @@ class FKSolver:
                 dtype=jnp.float32,
             )
         else:
-            self.prismatic_mask = None
+            self.joint_mode = None
             self.joint_axes = None
         self.mimic = self._build_mimic_arrays()
         zero_angles = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
@@ -855,22 +874,11 @@ class FKSolver:
             mimic = self.skeleton[name].get("mimic")
             if mimic is None:
                 continue
-            master = self.skeleton.get(mimic["master"], {})
-            master_axis = np.asarray(master.get("joint_axis", [1.0, 0.0, 0.0]))
-            if master.get("joint_type") == "prismatic":
-                comp, sign = 0, 1.0
-            else:
-                # Revolute masters are driven by the Euler component of their
-                # dominant axis, same as the URDF bounds in
-                # InverseKinematicsSolver
-                comp = int(np.argmax(np.abs(master_axis)))
-                sign = float(np.sign(master_axis[comp])) or 1.0
+            # The master's joint value is its first parameter
             rows.append(
                 (
                     idx,
                     slot_of.get(mimic["master"], -1),
-                    comp,
-                    sign,
                     mimic["multiplier"],
                     mimic["offset"],
                     self.skeleton[name].get("joint_axis", np.array([1.0, 0.0, 0.0])),
@@ -883,12 +891,10 @@ class FKSolver:
         return (
             jnp.asarray(cols[0], dtype=jnp.int32),
             jnp.asarray(cols[1], dtype=jnp.int32),
-            jnp.asarray(cols[2], dtype=jnp.int32),
+            jnp.asarray(cols[2], dtype=jnp.float32),
             jnp.asarray(cols[3], dtype=jnp.float32),
-            jnp.asarray(cols[4], dtype=jnp.float32),
-            jnp.asarray(cols[5], dtype=jnp.float32),
-            jnp.asarray(np.stack(cols[6]), dtype=jnp.float32),
-            jnp.asarray(cols[7], dtype=bool),
+            jnp.asarray(np.stack(cols[4]), dtype=jnp.float32),
+            jnp.asarray(cols[5], dtype=bool),
         )
 
     @classmethod
@@ -1036,7 +1042,7 @@ class FKSolver:
             tuple(self.controlled_indices),
             angle_vector,
             self.level_bounds,
-            self.prismatic_mask,
+            self.joint_mode,
             self.joint_axes,
             self.mimic,
         )
@@ -1239,34 +1245,13 @@ class InverseKinematicsSolver:
                         urdf_bounds.extend([(0, 0), (0, 0), (0, 0)])
                     elif bone_name in joint_info:
                         joint_type = joint_info[bone_name]["type"]
-                        joint_axis = joint_info[bone_name]["axis"]
 
                         if joint_type in ["revolute", "continuous"]:
-                            # For revolute joints, apply limits only to the primary rotation axis
-                            # Determine which axis has the largest component
-                            abs_axis = [abs(x) for x in joint_axis]
-                            main_axis = abs_axis.index(max(abs_axis))
-
-                            # Create bounds for X, Y, Z rotations
-                            axis_bounds = [
-                                (-10, 10),
-                                (-10, 10),
-                                (-10, 10),
-                            ]  # Default small range
-                            # Apply real limits to main axis. The Euler angle
-                            # rotates about the positive axis, so a joint
-                            # whose axis points the negative way has its
-                            # limits mirrored
-                            if joint_axis[main_axis] < 0:
-                                axis_bounds[main_axis] = (-upper, -lower)
-                            else:
-                                axis_bounds[main_axis] = (lower, upper)
-
-                            urdf_bounds.extend(axis_bounds)
-                            # print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
+                            # A single angle about the joint axis (see
+                            # _compute_fk_tf), the other two are unused
+                            urdf_bounds.extend([(lower, upper), (0, 0), (0, 0)])
                         elif joint_type == "prismatic":
-                            # Only the first parameter drives the slide (in
-                            # meters), the other two are unused by FK
+                            # Same for the slide, in meters
                             urdf_bounds.extend([(lower, upper), (0, 0), (0, 0)])
                         else:
                             # For other joint types, use conservative limits
@@ -1274,6 +1259,12 @@ class InverseKinematicsSolver:
                     else:
                         # Default for bones without joint info - conservative limits
                         urdf_bounds.extend([(lower, upper), (-30, 30), (-30, 30)])
+                elif self.fk_solver.skeleton.get(bone_name, {}).get("joint_type") in (
+                    "revolute",
+                    "continuous",
+                ):
+                    # Unlimited single-axis joint
+                    urdf_bounds.extend([(-180, 180), (0, 0), (0, 0)])
                 else:
                     # Default for bones without limits
                     urdf_bounds.extend([(-180, 180), (-180, 180), (-180, 180)])

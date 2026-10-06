@@ -23,6 +23,7 @@ Real-time inverse kinematics in pure JAX with differentiable objectives, traject
 - Optional SDF-based self-collision using mesh_to_sdf (falls back to trimesh)
 - Simple forward kinematics (FK) API, plus helpers to deform meshes (LBS or rigid) for visualization
 - Clean CLI for quick experiments and interactive PyVista rendering
+- Realtime visualizer: drag targets and watch any URDF/GLB model follow live
 
 Version 0.4 of the Jax-IK library now outperforms all other tested IK libraries, both in speed and success rate:
 
@@ -207,6 +208,37 @@ Optional flags:
 - --target_points: JSON array of 3D points, e.g. '[[0.3,0.2,0.5]]'
 - --subpoints: Number of time steps after the initial pose to optimize (trajectory length minus 1)
 
+
+## Realtime visualizer
+
+Drag a target sphere around and watch the model follow, with IK solved every frame:
+
+```bash
+# URDF: controlled joints default to the movable chain up to the end-effector
+jax-ik-viz models/panda/urdf/panda.urdf --end_effector panda_hand_tcp
+
+# SMPL-X: left arm preset (use --hand right for the other one)
+jax-ik-viz smplx.glb
+
+# Several end-effectors get one sphere each
+jax-ik-viz smplx.glb --controlled_bones left_shoulder left_elbow right_shoulder right_elbow \
+  --end_effector left_wrist right_wrist
+
+# Print bone names (and URDF joint types)
+jax-ik-viz models/panda/urdf/panda.urdf --list_bones
+```
+
+Each frame warm-starts from the previous pose and is anchored to it (`--smooth_weight`), so redundant chains don't jitter. `--learning_rate`, `--num_steps`, `--fps` and `--no_mesh` (skeleton only) are also available. If the package isn't installed, use `python -m jax_ik.visualizer` instead of `jax-ik-viz`.
+
+To watch angles from your own code, push them into the window:
+
+```python
+from jax_ik.visualizer import RealtimeVisualizer
+
+viz = RealtimeVisualizer(solver.fk_solver)
+for angles in my_angle_stream:  # flat angle vectors, as returned by solver.solve
+    viz.update(angles)
+```
 
 ## Concepts and API
 

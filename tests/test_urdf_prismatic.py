@@ -65,8 +65,9 @@ def test_solver_uses_metric_bounds_for_prismatic_joints():
     lower = np.asarray(solver.lower_bounds)
     upper = np.asarray(solver.upper_bounds)
 
-    # Revolute joint bounds are converted to radians
-    assert upper[2] == pytest.approx(np.radians(166.0), abs=1e-3)
+    # Revolute joint bounds are converted to radians, one angle per joint
+    assert upper[0] == pytest.approx(np.radians(166.0), abs=1e-3)
+    assert upper[1:3] == pytest.approx([0.0, 0.0])
     # Prismatic bounds stay in meters, only the first parameter can move
     assert lower[3:6] == pytest.approx([0.0, 0.0, 0.0])
     assert upper[3:6] == pytest.approx([FINGER_MAX, 0.0, 0.0])
@@ -122,7 +123,7 @@ def test_angle_vector_follows_controlled_bones_order():
 
     zero = np.zeros(6)
     moved = zero.copy()
-    moved[2] = 0.5  # first slot -> panda_link2
+    moved[0] = 0.5  # first slot -> panda_link2
     # panda_link1 sits above panda_link2, so it must stay put
     assert np.allclose(
         _global(fk_solver, zero, "panda_link1"),
@@ -143,7 +144,7 @@ def test_solver_bounds_follow_controlled_bones_order():
     )
     upper = np.asarray(solver.upper_bounds)
     assert upper[0:3] == pytest.approx([FINGER_MAX, 0.0, 0.0])
-    assert upper[5] == pytest.approx(np.radians(166.0), abs=1e-3)
+    assert upper[3] == pytest.approx(np.radians(166.0), abs=1e-3)
 
     # And the first slot really drives the finger in FK
     fk_solver = solver.fk_solver
@@ -227,9 +228,9 @@ def test_revolute_mimic_uses_master_joint_value(tmp_path):
     urdf.write_text(REVOLUTE_MIMIC_URDF)
     fk_solver = FKSolver(str(urdf), controlled_bones=["master"], do_compute_sdf=False)
 
-    # Euler z of 0.3 about +z is a joint value of -0.3 about the -z axis
-    master = _global(fk_solver, [0.0, 0.0, 0.3], "master")
-    slave = _global(fk_solver, [0.0, 0.0, 0.3], "slave")
+    # Joint value 0.3 about the -z axis, i.e. -0.3 about +z
+    master = _global(fk_solver, [0.3, 0.0, 0.0], "master")
+    slave = _global(fk_solver, [0.3, 0.0, 0.0], "slave")
     slave0 = _global(fk_solver, [0.0, 0.0, 0.0], "slave")
     base = _global(fk_solver, [0.0, 0.0, 0.0], "base")
 
@@ -241,9 +242,9 @@ def test_revolute_mimic_uses_master_joint_value(tmp_path):
         R = base[:3, :3].T @ g[:3, :3]
         return np.arctan2(R[1, 0], R[0, 0])
 
-    assert local_angle_about_z(master) == pytest.approx(0.3, abs=1e-5)
-    # slave = -2 * (-0.3) + 0.1 about +x
-    assert local_angle_about_x(slave) == pytest.approx(0.7, abs=1e-5)
+    assert local_angle_about_z(master) == pytest.approx(-0.3, abs=1e-5)
+    # slave = -2 * 0.3 + 0.1 about +x
+    assert local_angle_about_x(slave) == pytest.approx(-0.5, abs=1e-5)
     # Offset applies even at the master's zero position
     assert local_angle_about_x(slave0) == pytest.approx(0.1, abs=1e-5)
 
@@ -262,22 +263,65 @@ NEGATIVE_AXIS_URDF = """<?xml version="1.0"?>
 """
 
 
-def test_negative_axis_revolute_bounds_are_mirrored(tmp_path):
+def test_negative_axis_revolute_uses_urdf_limits(tmp_path):
     urdf = tmp_path / "negative_axis.urdf"
     urdf.write_text(NEGATIVE_AXIS_URDF)
     solver = InverseKinematicsSolver(
         str(urdf), controlled_bones=["arm"], compute_sdf=False
     )
 
-    # Euler z rotates about +z, so joint values [-0.2, 1.0] about -z
-    # correspond to Euler z in [-1.0, 0.2]
-    assert float(solver.lower_bounds[2]) == pytest.approx(-1.0, abs=1e-5)
-    assert float(solver.upper_bounds[2]) == pytest.approx(0.2, abs=1e-5)
+    # The angle is about the joint's own (negative) axis, so the URDF limits
+    # apply unchanged
+    assert float(solver.lower_bounds[0]) == pytest.approx(-0.2, abs=1e-5)
+    assert float(solver.upper_bounds[0]) == pytest.approx(1.0, abs=1e-5)
 
-    # The upper joint limit really is reachable at the new lower Euler bound
     fk_solver = solver.fk_solver
     base = _global(fk_solver, np.zeros(3), "base")
-    arm = _global(fk_solver, [0.0, 0.0, float(solver.lower_bounds[2])], "arm")
+    arm = _global(fk_solver, [float(solver.upper_bounds[0]), 0.0, 0.0], "arm")
     R = base[:3, :3].T @ arm[:3, :3]
     joint_value = -np.arctan2(R[1, 0], R[0, 0])  # angle about -z
     assert joint_value == pytest.approx(1.0, abs=1e-5)
+
+
+def test_mimic_model_loads_without_controlled_bones():
+    fk_solver = FKSolver(PANDA_URDF, controlled_bones=[], do_compute_sdf=False)
+    fk = np.asarray(fk_solver.compute_fk_from_angles(np.zeros(0)))
+    assert fk.shape == (len(fk_solver.bone_names), 4, 4)
+    assert np.all(np.isfinite(fk))
+
+
+def test_revolute_joints_only_rotate_about_their_axis():
+    bones = [f"panda_link{i}" for i in range(1, 8)]
+    solver = InverseKinematicsSolver(
+        PANDA_URDF, controlled_bones=bones, compute_sdf=False
+    )
+    fk_solver = solver.fk_solver
+
+    # Only the joint angle may move, the two other parameters are pinned
+    lower = np.asarray(solver.lower_bounds).reshape(-1, 3)
+    upper = np.asarray(solver.upper_bounds).reshape(-1, 3)
+    assert np.all(lower[:, 1:] == 0) and np.all(upper[:, 1:] == 0)
+    assert np.all(upper[:, 0] > lower[:, 0])
+
+    rng = np.random.default_rng(0)
+    angles = rng.uniform(-1.0, 1.0, (len(bones), 3)).astype(np.float32)
+    only_first = angles.copy()
+    only_first[:, 1:] = 0.0
+    # Off-axis parameters have no effect at all
+    assert np.allclose(
+        fk_solver.compute_fk_from_angles(angles.ravel()),
+        fk_solver.compute_fk_from_angles(only_first.ravel()),
+        atol=1e-6,
+    )
+
+    # Each joint's relative rotation is exactly about its URDF axis (z)
+    fk = np.asarray(fk_solver.compute_fk_from_angles(only_first.ravel()))
+    fk0 = np.asarray(fk_solver.compute_fk_from_angles(np.zeros(len(bones) * 3)))
+    for k, bone in enumerate(bones):
+        idx = fk_solver.bone_names.index(bone)
+        parent = fk_solver.parent_list[idx]
+        rel = np.linalg.inv(fk[parent]) @ fk[idx]
+        rel0 = np.linalg.inv(fk0[parent]) @ fk0[idx]
+        R = rel0[:3, :3].T @ rel[:3, :3]
+        assert np.allclose(R[:, 2], [0.0, 0.0, 1.0], atol=1e-5)
+        assert np.arctan2(R[1, 0], R[0, 0]) == pytest.approx(only_first[k, 0], abs=1e-5)

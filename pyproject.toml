@@ -25,6 +25,9 @@ dependencies = [
     "trimesh"
 ]
 
+[project.scripts]
+jax-ik-viz = "jax_ik.visualizer:main"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
