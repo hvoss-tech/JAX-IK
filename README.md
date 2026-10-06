@@ -276,3 +276,9 @@ Contributions are welcome via PRs. Please include tests for new functionality wh
 ## License
 
 Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters © 2025 by Hendric Voss is licensed under CC BY-NC-SA 4.0.
+
+### Third-party models
+
+Files under `models/` are not covered by the license above and keep their original licenses:
+
+- `models/panda/`: Franka Emika Panda (7-DOF arm with a 2-finger gripper), URDF with visual (`.dae`) and collision (`.stl`) meshes. Taken from [Gepetto/example-robot-data](https://github.com/Gepetto/example-robot-data/tree/master/robots/panda_description), originally from [frankaemika/franka_ros](https://github.com/frankaemika/franka_ros/tree/noetic-devel/franka_description). Licensed under the Apache License 2.0 (see `models/panda/LICENSE`). Modified: mesh paths in `panda.urdf` were changed from `package://` URIs to relative paths.

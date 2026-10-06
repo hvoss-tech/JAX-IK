@@ -145,6 +145,9 @@ def _compute_fk_tf(
     controlled_indices: tuple,
     angle_vector: jnp.ndarray,
     level_bounds: tuple,
+    prismatic_mask: jnp.ndarray = None,
+    joint_axes: jnp.ndarray = None,
+    mimic: tuple = None,
 ) -> jnp.ndarray:
     """
     Compute forward kinematics for a skeleton given joint angles.
@@ -168,6 +171,18 @@ def _compute_fk_tf(
         angle_vector (jnp.ndarray): Euler angles for controlled bones (K*3,).
         level_bounds (tuple): Static tuple of (start, end) slices, one per depth
             level, into the level-sorted arrays above.
+        prismatic_mask (jnp.ndarray): Optional (K,) bool, True for controlled
+            bones driven by a prismatic joint. For those, the first of the
+            bone's 3 parameters is a displacement (meters) along joint_axes
+            instead of an Euler angle; the other two are ignored.
+        joint_axes (jnp.ndarray): Optional (K, 3) unit joint axes, required
+            together with prismatic_mask.
+        mimic (tuple): Optional URDF mimic joints as arrays of length M:
+            (bone_idx, master_slot, master_component, master_sign, multiplier,
+            offset, axis (M, 3), is_prismatic). Each mimic bone's transform is
+            fully derived from its master joint's value (master_slot -1 means
+            the master is not controlled, i.e. at 0), overriding any
+            parameters of its own.
 
     Returns:
         jnp.ndarray: Global transforms for all bones (N, 4, 4), level-sorted order.
@@ -176,9 +191,31 @@ def _compute_fk_tf(
     num_controlled = len(controlled_indices)
 
     # Compute per-bone rotation matrices from Euler XYZ
-    R_updates = jax.vmap(tf_euler_to_matrix)(angle_vector.reshape(num_controlled, 3))
+    params = angle_vector.reshape(num_controlled, 3)
+    R_updates = jax.vmap(tf_euler_to_matrix)(params)
+
+    if prismatic_mask is not None:
+        T_updates = jnp.broadcast_to(
+            jnp.eye(4, dtype=jnp.float32), (num_controlled, 4, 4)
+        )
+        T_updates = T_updates.at[:, :3, 3].set(params[:, :1] * joint_axes)
+        R_updates = jnp.where(prismatic_mask[:, None, None], T_updates, R_updates)
 
     rotations = default_rotations.at[ctrl_idx_arr].set(R_updates)
+
+    if mimic is not None:
+        (m_idx, m_slot, m_comp, m_sign, m_mult, m_offset, m_axis, m_prismatic) = mimic
+        master_val = jnp.where(
+            m_slot >= 0,
+            params[jnp.maximum(m_slot, 0), m_comp] * m_sign,
+            0.0,
+        )
+        value = m_mult * master_val + m_offset
+        M_rot = jax.vmap(tf_rotation_matrix_from_axis_angle)(m_axis, value)
+        M_trans = jnp.broadcast_to(jnp.eye(4, dtype=jnp.float32), M_rot.shape)
+        M_trans = M_trans.at[:, :3, 3].set(value[:, None] * m_axis)
+        M_updates = jnp.where(m_prismatic[:, None, None], M_trans, M_rot)
+        rotations = rotations.at[m_idx].set(M_updates)
 
     # local_array and rotations don't depend on `carry`, so this combined
     # per-bone transform can be computed once, up front, for every bone in
@@ -769,14 +806,90 @@ class FKSolver:
         """
         self._prepare_fk_arrays(keep_bones=keep_bones)
         self.controlled_bones = controlled_bones if controlled_bones is not None else []
-        self.controlled_indices = [
-            i for i, name in enumerate(self.bone_names) if name in self.controlled_bones
-        ]
+        # The angle vector follows the caller's controlled_bones order (that's
+        # how bounds, hand specs and the Blender addon lay it out), not the
+        # internal level-sorted bone order
+        bone_index = {name: i for i, name in enumerate(self.bone_names)}
+        self.controlled_indices = list(
+            dict.fromkeys(
+                bone_index[name] for name in self.controlled_bones if name in bone_index
+            )
+        )
         self.default_rotations = jnp.stack(
             [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
         )
+        # Controlled bones driven by URDF prismatic joints slide instead of
+        # rotating (see _compute_fk_tf)
+        prismatic = [
+            self.skeleton[self.bone_names[i]].get("joint_type") == "prismatic"
+            for i in self.controlled_indices
+        ]
+        if any(prismatic):
+            self.prismatic_mask = jnp.asarray(prismatic, dtype=bool)
+            self.joint_axes = jnp.asarray(
+                np.stack(
+                    [
+                        self.skeleton[self.bone_names[i]].get(
+                            "joint_axis", np.array([1.0, 0.0, 0.0])
+                        )
+                        for i in self.controlled_indices
+                    ]
+                ),
+                dtype=jnp.float32,
+            )
+        else:
+            self.prismatic_mask = None
+            self.joint_axes = None
+        self.mimic = self._build_mimic_arrays()
         zero_angles = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
         self.bind_fk = self.compute_fk_from_angles(zero_angles)
+
+    def _build_mimic_arrays(self):
+        """Collect URDF mimic joints among the FK bones into the array tuple
+        _compute_fk_tf expects, or None if there are none."""
+        slot_of = {
+            self.bone_names[i]: k for k, i in enumerate(self.controlled_indices)
+        }
+        rows = []
+        for idx, name in enumerate(self.bone_names):
+            mimic = self.skeleton[name].get("mimic")
+            if mimic is None:
+                continue
+            master = self.skeleton.get(mimic["master"], {})
+            master_axis = np.asarray(master.get("joint_axis", [1.0, 0.0, 0.0]))
+            if master.get("joint_type") == "prismatic":
+                comp, sign = 0, 1.0
+            else:
+                # Revolute masters are driven by the Euler component of their
+                # dominant axis, same as the URDF bounds in
+                # InverseKinematicsSolver
+                comp = int(np.argmax(np.abs(master_axis)))
+                sign = float(np.sign(master_axis[comp])) or 1.0
+            rows.append(
+                (
+                    idx,
+                    slot_of.get(mimic["master"], -1),
+                    comp,
+                    sign,
+                    mimic["multiplier"],
+                    mimic["offset"],
+                    self.skeleton[name].get("joint_axis", np.array([1.0, 0.0, 0.0])),
+                    self.skeleton[name].get("joint_type") == "prismatic",
+                )
+            )
+        if not rows:
+            return None
+        cols = list(zip(*rows))
+        return (
+            jnp.asarray(cols[0], dtype=jnp.int32),
+            jnp.asarray(cols[1], dtype=jnp.int32),
+            jnp.asarray(cols[2], dtype=jnp.int32),
+            jnp.asarray(cols[3], dtype=jnp.float32),
+            jnp.asarray(cols[4], dtype=jnp.float32),
+            jnp.asarray(cols[5], dtype=jnp.float32),
+            jnp.asarray(np.stack(cols[6]), dtype=jnp.float32),
+            jnp.asarray(cols[7], dtype=bool),
+        )
 
     @classmethod
     def _pruned_view(
@@ -923,6 +1036,9 @@ class FKSolver:
             tuple(self.controlled_indices),
             angle_vector,
             self.level_bounds,
+            self.prismatic_mask,
+            self.joint_axes,
+            self.mimic,
         )
         return result
 
@@ -1073,6 +1189,7 @@ class InverseKinematicsSolver:
             model_file (str): Path to the model file.
             controlled_bones (list): List of bone names to control.
             bounds (list): List of (min, max) tuples for each joint angle (degrees).
+                For URDF prismatic joints the bounds are displacements in meters.
             penalty_weight (float): Weight for regularization penalty.
             threshold (float): Stop if loss falls below this value.
             num_steps (int): Maximum number of optimization steps.
@@ -1117,7 +1234,10 @@ class InverseKinematicsSolver:
                     # print(f"Bone '{bone_name}' limits: {lower} to {upper}")
 
                     # Get joint information
-                    if bone_name in joint_info:
+                    if "mimic" in self.fk_solver.skeleton.get(bone_name, {}):
+                        # Fully driven by its master joint, own parameters unused
+                        urdf_bounds.extend([(0, 0), (0, 0), (0, 0)])
+                    elif bone_name in joint_info:
                         joint_type = joint_info[bone_name]["type"]
                         joint_axis = joint_info[bone_name]["axis"]
 
@@ -1133,13 +1253,21 @@ class InverseKinematicsSolver:
                                 (-10, 10),
                                 (-10, 10),
                             ]  # Default small range
-                            axis_bounds[main_axis] = (
-                                lower,
-                                upper,
-                            )  # Apply real limits to main axis
+                            # Apply real limits to main axis. The Euler angle
+                            # rotates about the positive axis, so a joint
+                            # whose axis points the negative way has its
+                            # limits mirrored
+                            if joint_axis[main_axis] < 0:
+                                axis_bounds[main_axis] = (-upper, -lower)
+                            else:
+                                axis_bounds[main_axis] = (lower, upper)
 
                             urdf_bounds.extend(axis_bounds)
                             # print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
+                        elif joint_type == "prismatic":
+                            # Only the first parameter drives the slide (in
+                            # meters), the other two are unused by FK
+                            urdf_bounds.extend([(lower, upper), (0, 0), (0, 0)])
                         else:
                             # For other joint types, use conservative limits
                             urdf_bounds.extend([(lower, upper), (-10, 10), (-10, 10)])
@@ -1151,7 +1279,22 @@ class InverseKinematicsSolver:
                     urdf_bounds.extend([(-180, 180), (-180, 180), (-180, 180)])
             bounds = urdf_bounds
 
-        bounds_radians = [(np.radians(l), np.radians(h)) for l, h in bounds]
+        # Prismatic joint bounds are linear (meters) and must not be converted
+        prismatic_bones = {
+            name
+            for name in self.controlled_bones
+            if self.fk_solver.skeleton.get(name, {}).get("joint_type") == "prismatic"
+        }
+        bounds_radians = []
+        for i, (l, h) in enumerate(bounds):
+            bone_idx = i // 3
+            if (
+                bone_idx < len(self.controlled_bones)
+                and self.controlled_bones[bone_idx] in prismatic_bones
+            ):
+                bounds_radians.append((l, h))
+            else:
+                bounds_radians.append((np.radians(l), np.radians(h)))
         lower_bounds, upper_bounds = zip(*bounds_radians)
         self.lower_bounds = jnp.asarray(lower_bounds, dtype=jnp.float32)
         self.upper_bounds = jnp.asarray(upper_bounds, dtype=jnp.float32)

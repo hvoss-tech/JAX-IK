@@ -354,6 +354,22 @@ def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
             # The local transform of the child is the joint's origin transform
             # This positions the child relative to the parent
             skeleton[child_link]["local_transform"] = joint.origin.astype(np.float32)
+            skeleton[child_link]["joint_type"] = joint.joint_type
+            axis = np.asarray(
+                joint.axis if joint.axis is not None else [1.0, 0.0, 0.0],
+                dtype=np.float32,
+            )
+            norm = np.linalg.norm(axis)
+            skeleton[child_link]["joint_axis"] = (
+                axis / norm if norm > 0 else np.array([1.0, 0.0, 0.0], np.float32)
+            )
+            if joint.mimic is not None:
+                # Resolved to the master joint's child link once all joints are known
+                skeleton[child_link]["mimic"] = {
+                    "master": joint.mimic.joint,
+                    "multiplier": float(joint.mimic.multiplier),
+                    "offset": float(joint.mimic.offset),
+                }
 
             # Store joint limits if available with more restrictive defaults
             if joint.limit is not None and joint.joint_type in [
@@ -364,6 +380,12 @@ def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
                 if joint.joint_type == "continuous":
                     # Continuous joints get reasonable limits to prevent wild movements
                     limits[child_link] = (-90, 90)
+                elif joint.joint_type == "prismatic":
+                    # Prismatic limits are linear displacements, keep them in meters
+                    limits[child_link] = (
+                        float(joint.limit.lower),
+                        float(joint.limit.upper),
+                    )
                 else:
                     # Convert to degrees and apply more conservative limits for safety
                     lower_deg = max(np.rad2deg(joint.limit.lower), -180)
@@ -375,6 +397,16 @@ def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
                     limits[child_link] = (0, 0)  # No movement for fixed joints
                 else:
                     limits[child_link] = (-30, 30)  # Conservative default
+
+    # Mimic joints reference their master by joint name, bones are links
+    joint_child = {joint.name: joint.child for joint in robot.joints}
+    for bone in skeleton.values():
+        mimic = bone.get("mimic")
+        if mimic is not None:
+            if mimic["master"] in joint_child:
+                mimic["master"] = joint_child[mimic["master"]]
+            else:
+                del bone["mimic"]
 
     # Apply coordinate system transformation to root links
     root_links = [name for name, bone in skeleton.items() if bone["parent"] is None]
