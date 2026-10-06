@@ -228,7 +228,15 @@ jax-ik-viz smplx.glb --controlled_bones left_shoulder left_elbow right_shoulder 
 jax-ik-viz models/panda/urdf/panda.urdf --list_bones
 ```
 
-Each frame warm-starts from the previous pose and is anchored to it (`--smooth_weight`), so redundant chains don't jitter. `--learning_rate`, `--num_steps`, `--fps` and `--no_mesh` (skeleton only) are also available. If the package isn't installed, use `python -m jax_ik.visualizer` instead of `jax-ik-viz`.
+Instead of dragging, `--random_targets SECONDS` picks new reachable targets every few seconds, solves a smoothed trajectory to them (`--ik_points`, default 10, smoothed with `CombinedDerivativeObj`, `--smoothing`, default 0.05) and plays it back over `--playback` seconds:
+
+```bash
+jax-ik-viz models/panda/urdf/panda.urdf --end_effector panda_hand_tcp --random_targets 5
+```
+
+`examples/panda_trajectory_demo.py` does the same from Python with `TrajectoryPlanner` and `RealtimeVisualizer.run_trajectory`.
+
+When dragging, each frame warm-starts from the previous pose and is anchored to it (`--smooth_weight`), so redundant chains don't jitter. `--learning_rate`, `--num_steps`, `--fps` and `--no_mesh` (skeleton only) are also available. If the package isn't installed, use `python -m jax_ik.visualizer` instead of `jax-ik-viz`.
 
 To watch angles from your own code, push them into the window:
 

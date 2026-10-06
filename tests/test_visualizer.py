@@ -8,6 +8,7 @@ from jax_ik.ik import FKSolver, InverseKinematicsSolver
 from jax_ik.visualizer import (
     IKController,
     MeshPoser,
+    TrajectoryPlanner,
     default_controlled_bones,
     load_mesh_data,
 )
@@ -116,6 +117,63 @@ def test_ik_controller_starts_inside_bounds(panda_solver):
     assert np.all(controller.angles <= np.asarray(panda_solver.upper_bounds))
 
 
+@pytest.fixture(scope="module")
+def panda_traj_solver():
+    return InverseKinematicsSolver(
+        PANDA_URDF,
+        controlled_bones=PANDA_ARM,
+        threshold=1e-6,
+        num_steps=1000,
+        compute_sdf=False,
+    )
+
+
+def _mid(solver):
+    return (np.asarray(solver.lower_bounds) + np.asarray(solver.upper_bounds)) / 2
+
+
+def test_trajectory_planner_reaches_random_targets(panda_traj_solver):
+    planner = TrajectoryPlanner(
+        panda_traj_solver, ["panda_hand_tcp"], initial_angles=_mid(panda_traj_solver), seed=0
+    )
+    dists = []
+    for _ in range(5):
+        start = planner.pose.copy()
+        targets = planner.random_targets()
+        traj = planner.plan(targets)
+        assert traj.shape == (planner.ik_points + 1, len(PANDA_ARM) * 3)
+        # Frame 0 is the pose we start from
+        assert np.allclose(traj[0], start)
+        dists.append(np.linalg.norm(planner.end_effector_paths()[0][-1] - targets[0]))
+
+        # Playback ends on the last frame, which seeds the next plan
+        assert np.allclose(planner.sample(0.0), traj[0])
+        # Halfway through 11 frames is exactly frame 5
+        assert np.allclose(planner.sample(0.5), traj[5])
+        assert np.allclose(planner.sample(1.0), traj[-1])
+        assert np.allclose(planner.pose, traj[-1])
+    assert np.median(dists) < 5e-3
+
+
+def test_trajectory_smoothing_reduces_jumps(panda_traj_solver):
+    jumps = {}
+    for smoothing in (0.0, 0.05):
+        planner = TrajectoryPlanner(
+            panda_traj_solver,
+            ["panda_hand_tcp"],
+            smoothing=smoothing,
+            initial_angles=_mid(panda_traj_solver),
+            seed=1,
+        )
+        worst = 0.0
+        for _ in range(4):
+            traj = planner.plan(planner.random_targets())
+            planner.sample(1.0)
+            worst = max(worst, np.abs(np.diff(traj, axis=0)).max())
+        jumps[smoothing] = worst
+    assert jumps[0.05] < jumps[0.0]
+
+
 def test_visualizer_updates_mesh_offscreen(panda_solver, panda_mesh):
     pv = pytest.importorskip("pyvista")
     pv.OFF_SCREEN = True
@@ -141,4 +199,23 @@ def test_visualizer_updates_mesh_offscreen(panda_solver, panda_mesh):
 
     controller = IKController(panda_solver, ["panda_hand_tcp"])
     viz.run_interactive(controller)  # offscreen show returns right away
+    viz.plotter.close()
+
+
+def test_trajectory_mode_offscreen(panda_traj_solver, panda_mesh):
+    pv = pytest.importorskip("pyvista")
+    pv.OFF_SCREEN = True
+    from jax_ik.visualizer import RealtimeVisualizer
+
+    try:
+        viz = RealtimeVisualizer(panda_traj_solver.fk_solver, mesh_data=panda_mesh)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"No offscreen rendering available: {e}")
+    planner = TrajectoryPlanner(
+        panda_traj_solver, ["panda_hand_tcp"], initial_angles=_mid(panda_traj_solver)
+    )
+    viz.run_trajectory(planner, interval=5.0, playback=2.0)
+    # The first target was planned and the pose set to its start
+    assert len(planner.trajectory) == planner.ik_points + 1
+    assert np.allclose(viz.mesh.points, viz.poser.pose(planner.pose)[0], atol=1e-5)
     viz.plotter.close()

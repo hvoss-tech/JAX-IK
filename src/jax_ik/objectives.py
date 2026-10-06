@@ -40,6 +40,13 @@ def _safe_arccos(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     return jnp.arccos(jnp.clip(x, -1.0 + eps, 1.0 - eps))
 
 
+# SDF value used for points outside the grid ("free space"). Must be finite:
+# linear interpolation multiplies out-of-grid neighbours by their weight, and
+# with inf that is inf * 0 = nan for any point on or past the grid's edge,
+# which also turns every gradient into nan.
+_SDF_OUTSIDE = 1e6
+
+
 def get_config(X: jnp.ndarray) -> jnp.ndarray:
     """
     Get the last configuration from a trajectory or return the configuration itself if 1D.
@@ -233,7 +240,7 @@ class DistanceObjTraj(ObjectiveFunction):
         self.target_points = np.asarray(target_points, np.float32)
         if self.target_points.ndim == 1:
             self.target_points = self.target_points[None, :]
-        if self.target_points.shape[-1] != 3:
+        if self.target_points.ndim != 2 or self.target_points.shape[-1] != 3:
             raise ValueError("target_points must have shape (M,3) or (3,)")
 
         self.weight = np.asarray(weight, np.float32)
@@ -980,7 +987,7 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         coords = (points - self.sdf_origin) / self.sdf_spacing
         # Use JAX's map_coordinates for interpolation
         return jax.scipy.ndimage.map_coordinates(
-            self.sdf_grid, coords.T, order=1, mode="constant", cval=jnp.inf
+            self.sdf_grid, coords.T, order=1, mode="constant", cval=_SDF_OUTSIDE
         )
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
@@ -1076,7 +1083,7 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         """
         coords = (points - sdf["origin"]) / sdf["spacing"]
         return jax.scipy.ndimage.map_coordinates(
-            sdf["grid"], coords.T, order=1, mode="constant", cval=jnp.inf
+            sdf["grid"], coords.T, order=1, mode="constant", cval=_SDF_OUTSIDE
         )
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:

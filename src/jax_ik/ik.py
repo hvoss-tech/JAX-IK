@@ -603,7 +603,15 @@ def _solve_ik_core(
     # (mand + opt), so optional objectives keep shaping the pose every
     # iteration -- `mand` just rides along from the same forward pass so
     # convergence/best-selection can be judged on it separately, below.
-    value_and_grad = jax.value_and_grad(obj_free, has_aux=True)
+    raw_value_and_grad = jax.value_and_grad(obj_free, has_aux=True)
+
+    def value_and_grad(x):
+        # The loss itself is already made finite in compute_objectives, but a
+        # nan/inf gradient (e.g. sqrt of a negative in some objective) would
+        # still turn every joint angle into nan through the Adam update.
+        # Zeroing those entries lets the other objectives keep driving x.
+        value, grad = raw_value_and_grad(x)
+        return value, jnp.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Each iteration needs the objective value *and* gradient both at its
     # starting point (to take the step) and at the resulting point (to
@@ -771,6 +779,14 @@ class FKSolver:
         else:
             raise ValueError(f"Unsupported file type: {self.file_type}")
 
+        unknown = [
+            name
+            for name in [*(controlled_bones or []), *(bones_of_interest or [])]
+            if name not in self.skeleton
+        ]
+        if unknown:
+            raise ValueError(f"Bones not found in skeleton: {unknown}")
+
         keep_bones = None
         if bones_of_interest is not None:
             keep_bones = self._bone_closure(controlled_bones, bones_of_interest)
@@ -821,7 +837,8 @@ class FKSolver:
         self.skeleton is already set.
         """
         self._prepare_fk_arrays(keep_bones=keep_bones)
-        self.controlled_bones = controlled_bones if controlled_bones is not None else []
+        # Duplicates would make the angle vector shorter than the bounds
+        self.controlled_bones = list(dict.fromkeys(controlled_bones or []))
         # The angle vector follows the caller's controlled_bones order (that's
         # how bounds, hand specs and the Blender addon lay it out), not the
         # internal level-sorted bone order
@@ -1270,6 +1287,18 @@ class InverseKinematicsSolver:
                     urdf_bounds.extend([(-180, 180), (-180, 180), (-180, 180)])
             bounds = urdf_bounds
 
+        if not self.controlled_bones:
+            raise ValueError("At least one controlled bone is required")
+        if bounds is None:
+            raise ValueError(
+                "bounds are required for models without joint limits (GLB/GLTF)"
+            )
+        if len(bounds) != 3 * len(self.controlled_bones):
+            raise ValueError(
+                f"Expected {3 * len(self.controlled_bones)} bounds (3 per controlled "
+                f"bone), got {len(bounds)}"
+            )
+
         # Prismatic joint bounds are linear (meters) and must not be converted
         prismatic_bones = {
             name
@@ -1525,6 +1554,7 @@ def export_frames(
         export_file (str): Output JSON file path.
     """
     initial_rot = np.asarray(initial_rot)
+    solved_angles = np.asarray(solved_angles)
     num_bones = initial_rot.shape[0] // 3
     if len(controlled_bones) != num_bones:
         raise ValueError("controlled_bones length mismatches initial configuration")
@@ -1569,6 +1599,7 @@ def export_all_frames(
     all_frames = []
     for init_rot, solved_angles in trajectories:
         init_rot = np.asarray(init_rot)
+        solved_angles = np.asarray(solved_angles)
         num_bones = init_rot.shape[0] // 3
         if len(controlled_bones) != num_bones:
             raise ValueError("controlled_bones length mismatches initial configuration")

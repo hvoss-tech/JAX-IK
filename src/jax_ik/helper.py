@@ -372,15 +372,16 @@ def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
                 }
 
             # Store joint limits if available with more restrictive defaults
-            if joint.limit is not None and joint.joint_type in [
+            if joint.joint_type == "continuous":
+                # Continuous joints get reasonable limits to prevent wild
+                # movements. They usually have no <limit> tag at all, so this
+                # must not depend on one being present
+                limits[child_link] = (-90, 90)
+            elif joint.limit is not None and joint.joint_type in [
                 "revolute",
                 "prismatic",
-                "continuous",
             ]:
-                if joint.joint_type == "continuous":
-                    # Continuous joints get reasonable limits to prevent wild movements
-                    limits[child_link] = (-90, 90)
-                elif joint.joint_type == "prismatic":
+                if joint.joint_type == "prismatic":
                     # Prismatic limits are linear displacements, keep them in meters
                     limits[child_link] = (
                         float(joint.limit.lower),
@@ -928,7 +929,8 @@ def _load_mesh_data_rigid(
     # Correctly get transform from scene graph using the geometry key
     if mesh_key in scene.graph.geometry_nodes:
         node_name = scene.graph.geometry_nodes[mesh_key][0]
-        mesh_transform = scene.graph.get(node_name)
+        # graph.get returns (transform, geometry name)
+        mesh_transform, _ = scene.graph.get(node_name)
     else:
         print(
             "Warning: No scene graph node found for the mesh. Using identity transform."
@@ -936,7 +938,14 @@ def _load_mesh_data_rigid(
 
     target_face_count = int(mesh_trimesh.faces.shape[0] * reduction_factor)
     if target_face_count > 0 and target_face_count < mesh_trimesh.faces.shape[0]:
-        mesh_trimesh = mesh_trimesh.simplify_quadric_decimation(target_face_count)
+        try:
+            # Keyword: trimesh's first positional parameter is `percent`
+            mesh_trimesh = mesh_trimesh.simplify_quadric_decimation(
+                face_count=target_face_count
+            )
+        except ImportError:
+            # Needs the optional fast_simplification package
+            print("Warning: mesh decimation unavailable, using the full mesh.")
 
     vertices = mesh_trimesh.vertices
     ones = np.ones((vertices.shape[0], 1))
