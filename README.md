@@ -24,6 +24,7 @@ Real-time inverse kinematics in pure JAX with differentiable objectives, traject
 - Simple forward kinematics (FK) API, plus helpers to deform meshes (LBS or rigid) for visualization
 - Clean CLI for quick experiments and interactive PyVista rendering
 - Realtime visualizer: drag targets and watch any URDF/GLB model follow live
+- Realtime self-collision avoidance with conservative low-res proxies, as a soft penalty or a hard constraint
 
 Version 0.4 of the Jax-IK library now outperforms all other tested IK libraries, both in speed and success rate:
 
@@ -247,6 +248,40 @@ viz = RealtimeVisualizer(solver.fk_solver)
 for angles in my_angle_stream:  # flat angle vectors, as returned by solver.solve
     viz.update(angles)
 ```
+
+## Self-collision
+
+`jax_ik.collision` keeps a model's links from running into each other, e.g. a robot arm folding into itself.
+
+**The proxy.** `CollisionModel` builds a low-resolution collision proxy for every link from the mesh you already have: a signed distance grid that never overstates the distance to the mesh (so the proxy always contains the whole link, never cuts into it) plus a sparse set of surface points with coverage radii. Its zero surface is a watertight low-res envelope around each link, which the visualizer can show. Proxies are built once in the bone frames and simply move with the bones. Checking a pair looks one link's points up in the other's grid, giving a lower bound on the true distance; a broad phase skips pairs that are clearly apart. Adjacent links, and pairs that collide in almost every random pose (sampled within the joint limits), are not checked.
+
+```python
+from jax_ik.collision import CollisionModel, SelfCollisionObj
+
+model = CollisionModel.cached(            # built once (~20 s for the Panda), then cached on disk
+    solver.fk_solver,
+    resolution=0.01,                      # sample spacing; the grid uses half of it
+    lower=solver.lower_bounds, upper=solver.upper_bounds,
+)
+print(model.clearances(angles, solver.fk_solver))   # per link pair, meters
+```
+
+**Soft vs hard.** `SelfCollisionObj` goes into the objective lists like any other objective:
+
+- Soft (`hard=False`): a penalty on links coming within `margin` of each other, traded off against the other objectives. Slight intrusions are possible when a target demands them.
+- Hard (`hard=True`): the solver guarantees the result never gets closer than `margin` (a buffer zone, can be 0) if the start pose was clear, including the motion between the start and every trajectory frame. A colliding start can only improve. A penalty starting `influence` before the margin steers the pose around obstacles.
+
+```python
+solver.solve(
+    initial_rotations=current,
+    mandatory_objective_functions=[DistanceObjTraj("panda_hand_tcp", [target], True)],
+    optional_objective_functions=[SelfCollisionObj(model, margin=0.005, hard=True)],
+)
+```
+
+In the visualizer, add `--collision soft|hard` (with `--collision_margin`, `--collision_resolution`); `m` cycles the mode live and `c` shows/hides the proxies. `examples/panda_collision_demo.py` plays trajectories to deliberately self-colliding targets.
+
+Proxies of skinned models (e.g. SMPL-X) are rigid per bone, so they cover the rest pose exactly but only approximate skin stretching near joints. For open (non-watertight) meshes, "inside" is what voxel filling can close; the surface itself is always covered.
 
 ## Concepts and API
 

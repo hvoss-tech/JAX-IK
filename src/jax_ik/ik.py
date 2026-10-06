@@ -457,6 +457,14 @@ def solve_ik(
 
     static_mandatory = _populate(_MANDATORY_POOL, mandatory_obj_fns)
     static_optional = _populate(_OPTIONAL_POOL, optional_obj_fns)
+    # Hard constraints (e.g. SelfCollisionObj(hard=True)) are passed in either
+    # list like any objective; their penalty is part of the loss as usual and
+    # the solver additionally never lets their violation grow
+    constraints = tuple(
+        fn
+        for fn in (*static_mandatory, *static_optional)
+        if getattr(fn, "is_hard_constraint", False)
+    )
 
     if mask is None:
         mask = np.concatenate(
@@ -484,7 +492,20 @@ def solve_ik(
         patience=patience,
         has_mandatory=has_mandatory,
         free_indices=free_indices,
+        constraint_fns=constraints,
     )
+
+
+# Hard constraints are checked every _CHECK_EVERY steps (and on the result);
+# a failed check bisects back towards the last feasible checkpoint, at most
+# _MAX_BISECT halvings deep
+_CHECK_EVERY = 8
+_MAX_BISECT = 6
+# How close to its limit a hard constraint counts as blocking when sliding
+# along it (meters for collision clearances)
+_SLIDE_BAND = 0.002
+# Outward part of a slide, relative to the step length
+_SLIDE_PUSH = 0.25
 
 
 @partial(
@@ -517,6 +538,7 @@ def _solve_ik_core(
     patience: int = 200,
     has_mandatory: bool = True,
     free_indices: jnp.ndarray = None,
+    constraint_fns: tuple = (),
 ) -> tuple:
     """
     Core JIT-compiled IK optimization loop using cautious Adam and early stopping.
@@ -544,6 +566,17 @@ def _solve_ik_core(
             objective was supplied. Static: gates whether convergence/best
             selection is judged on mandatory-only loss or combined loss.
         free_indices (jnp.ndarray): Indices of frames to optimize.
+        constraint_fns (tuple): Hard constraints, objects with a
+            `violation(X, fk_solver)` method returning values >= 0. Their
+            penalty steers the optimization as usual; on top of that the
+            pose is checked every _CHECK_EVERY steps and once more at the
+            end, and whenever the total violation went up since the last
+            feasible checkpoint, the pose is moved back along the straight
+            line towards that checkpoint until it doesn't. The returned
+            pose therefore never has a larger total violation than the
+            start: a feasible start gives a feasible result. Violations are
+            compared exactly, so constraints should absorb float noise
+            themselves (e.g. ignore violations below a tiny tolerance).
 
     Returns:
         tuple: (iterations, final_angles, best_loss, status_code) -- best_loss
@@ -613,16 +646,60 @@ def _solve_ik_core(
         value, grad = raw_value_and_grad(x)
         return value, jnp.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Each iteration needs the objective value *and* gradient both at its
-    # starting point (to take the step) and at the resulting point (to
-    # decide whether it improved on the best-so-far). Naively that's two
-    # forward passes per iteration -- but the "resulting point" of iteration
-    # i is the "starting point" of iteration i+1, so its value/gradient only
-    # need to be computed once. We thread (total, grad) for the *current* x
-    # through the loop state instead of recomputing them at the top of every
-    # iteration, cutting one full (FK-heavy) forward pass per step.
+    has_constraints = len(constraint_fns) > 0
+
+    def violations(x_free):
+        x_full = X_full.at[free_indices].set(x_free)
+        return jnp.concatenate(
+            [jnp.ravel(c.violation(x_full, fksolver)) for c in constraint_fns]
+        )
+
+    def near_violation(x_free):
+        # Constraints within a hair of their limit, squared so the gradient
+        # points away from exactly the ones that block the motion
+        x_full = X_full.at[free_indices].set(x_free)
+        return sum(
+            jnp.sum(jnp.square(c.violation(x_full, fksolver, extra=_SLIDE_BAND)))
+            for c in constraint_fns
+        )
+
+    def slide_back(x_safe, v_safe, x):
+        """Like bisect_back, but first try the motion with its component
+        into the blocking constraints removed, so the pose slides along the
+        boundary instead of being pulled back as a whole."""
+        n = jnp.nan_to_num(jax.grad(near_violation)(x_safe))
+        delta = x - x_safe
+        nn = jnp.sum(n * n) + 1e-12
+        into = jnp.maximum(jnp.sum(delta * n), 0.0) / nn
+        # Also step slightly outwards: the boundary curves, so a purely
+        # tangential step would still cut into it
+        out = _SLIDE_PUSH * jnp.sqrt(jnp.sum(delta * delta) / nn)
+        x_slide = jnp.clip(x - (into + out) * n, lower_b, upper_b)
+        x_ok, v_ok, ok = bisect_back(x_safe, v_safe, x_slide)
+        return jax.lax.cond(
+            ok, lambda _: (x_ok, v_ok, ok), lambda _: bisect_back(x_safe, v_safe, x), None
+        )
+
+    def bisect_back(x_safe, v_safe, x):
+        """Furthest point from x_safe towards x whose total violation is
+        no larger than at x_safe (x_safe itself if none is found)."""
+        budget = jnp.sum(v_safe)
+
+        def cond(c):
+            k, ok, _, _ = c
+            return jnp.logical_and(jnp.logical_not(ok), k <= _MAX_BISECT)
+
+        def body(c):
+            k, _, _, _ = c
+            x_try = x_safe + (0.5**k) * (x - x_safe)
+            v_try = violations(x_try)
+            return k + 1, jnp.sum(v_try) <= budget, x_try, v_try
+
+        _, ok, x_try, v_try = jax.lax.while_loop(cond, body, (0, False, x_safe, v_safe))
+        return jnp.where(ok, x_try, x_safe), jnp.where(ok, v_try, v_safe), ok
+
     def gd_step(state):
-        i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad = state
+        (i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad, cp) = state
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
@@ -658,6 +735,30 @@ def _solve_ik_core(
 
         x_new = jnp.clip(x - step, lower_b, upper_b)
 
+        if has_constraints:
+            x_safe, v_safe = cp
+
+            def checkpoint(_):
+                v_new = violations(x_new)
+                fine = jnp.sum(v_new) <= jnp.sum(v_safe)
+
+                def repair(_):
+                    x_ok, v_ok, _ = slide_back(x_safe, v_safe, x_new)
+                    return x_ok, (x_ok, v_ok), False
+
+                return jax.lax.cond(
+                    fine, lambda _: (x_new, (x_new, v_new), True), repair, None
+                )
+
+            x_new, cp, clean = jax.lax.cond(
+                (i + 1) % _CHECK_EVERY == 0,
+                checkpoint,
+                lambda _: (x_new, cp, True),
+                None,
+            )
+            # Don't keep pushing in the direction that was cut short
+            m = jnp.where(clean, m, jnp.zeros_like(m))
+
         (new_total, new_mand), new_grad = value_and_grad(x_new)
 
         # "Best" is judged on mandatory loss alone (total as a tie-break)
@@ -690,10 +791,11 @@ def _solve_ik_core(
             new_total,
             new_mand,
             new_grad,
+            cp,
         )
 
     def gd_cond(state):
-        i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad = state
+        i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad, cp = state
         # Require a minimal number of iterations before allowing threshold-based early stop
         min_thresh_iters = 1
         patience_ret = jnp.logical_and(i < num_steps, no_improve < patience)
@@ -714,6 +816,7 @@ def _solve_ik_core(
         total0,
         mand0,
         grad0,
+        (x0_free, violations(x0_free)) if has_constraints else (x0_free, jnp.zeros(1)),
     )
     (
         iterations,
@@ -727,7 +830,13 @@ def _solve_ik_core(
         _,
         _,
         _,
+        _cp,
     ) = jax.lax.while_loop(gd_cond, gd_step, init_state)
+
+    if has_constraints:
+        # The last steps since the final checkpoint haven't been checked yet
+        x_safe, v_safe = _cp
+        best_free, _, _ = slide_back(x_safe, v_safe, best_free)
 
     final_traj = X_full.at[free_indices].set(best_free)
     best_metric = best_mand if has_mandatory else best_total

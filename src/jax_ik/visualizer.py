@@ -15,6 +15,7 @@ Two ways to use it:
 import argparse
 import pathlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.numpy as jnp
@@ -119,12 +120,15 @@ class IKController:
         smooth_weight: float = 0.1,
         patience: int = 20,
         initial_angles: np.ndarray = None,
+        extra_objectives: list = None,
     ):
         self.solver = solver
         self.end_effectors = list(end_effectors)
         self.learning_rate = learning_rate
         self.smooth_weight = smooth_weight
         self.patience = patience
+        # Added to every solve, e.g. a SelfCollisionObj; may be swapped live
+        self.extra_objectives = list(extra_objectives or [])
         if initial_angles is None:
             initial_angles = np.zeros(solver.lower_bounds.shape, dtype=np.float32)
         # Zero isn't always a legal pose (e.g. the Panda's 4th joint)
@@ -157,7 +161,8 @@ class IKController:
         optional = [
             InitPoseObj(
                 init_rot=self.angles, last_position=True, weight=self.smooth_weight
-            )
+            ),
+            *self.extra_objectives,
         ]
         result, loss, _ = self.solver.solve(
             initial_rotations=self.angles,
@@ -190,9 +195,12 @@ class TrajectoryPlanner:
         patience: int = 200,
         initial_angles: np.ndarray = None,
         seed: int = None,
+        extra_objectives: list = None,
     ):
         self.solver = solver
         self.end_effectors = list(end_effectors)
+        # Added to every plan, e.g. a SelfCollisionObj; may be swapped live
+        self.extra_objectives = list(extra_objectives or [])
         self.ik_points = ik_points
         self.smoothing = smoothing
         self.learning_rate = learning_rate
@@ -226,9 +234,20 @@ class TrajectoryPlanner:
         """Trajectory (ik_points + 1, D) from the current pose to `targets`;
         frame 0 is the current pose.
         """
+        traj, loss, steps, ms = self.solve_trajectory(self.pose, targets)
+        self.solve_ms = ms
+        self.trajectory = traj
+        self.loss = loss
+        self.steps = steps
+        return self.trajectory
+
+    def solve_trajectory(self, start_pose, targets: list) -> tuple:
+        """Like plan, but from `start_pose` and without changing the
+        planner's state, so it can run in the background while the current
+        trajectory plays. Returns (trajectory, loss, steps, solve ms)."""
         start = time.perf_counter()
         traj, loss, steps = self.solver.solve(
-            initial_rotations=self.pose,
+            initial_rotations=np.asarray(start_pose, dtype=np.float32),
             learning_rate=self.learning_rate,
             mandatory_objective_functions=[
                 DistanceObjTraj(
@@ -239,17 +258,15 @@ class TrajectoryPlanner:
                 for name, target in zip(self.end_effectors, targets)
             ],
             optional_objective_functions=[
-                CombinedDerivativeObj(max_order=3, weight=self.smoothing)
+                CombinedDerivativeObj(max_order=3, weight=self.smoothing),
+                *self.extra_objectives,
             ],
             ik_points=self.ik_points,
             patience=self.patience,
             verbose=False,
         )
-        self.solve_ms = (time.perf_counter() - start) * 1000.0
-        self.trajectory = np.asarray(traj, dtype=np.float32)
-        self.loss = loss
-        self.steps = steps
-        return self.trajectory
+        ms = (time.perf_counter() - start) * 1000.0
+        return np.asarray(traj, dtype=np.float32), loss, steps, ms
 
     def end_effector_paths(self, traj: np.ndarray = None) -> list:
         """One (T, 3) path per end-effector through the trajectory frames."""
@@ -270,6 +287,32 @@ class TrajectoryPlanner:
         w = x - i
         self.pose = ((1 - w) * traj[i] + w * traj[i + 1]).astype(np.float32)
         return self.pose
+
+
+class CollisionModes:
+    """The objectives for each self-collision mode, cycled with the 'm' key."""
+
+    NAMES = ("off", "soft", "hard")
+
+    def __init__(self, model, margin=0.005, mode="hard", weight=None):
+        from jax_ik.collision import SelfCollisionObj
+
+        self.model = model
+        self.margin = float(margin)
+        self.objectives = {
+            "off": [],
+            "soft": [SelfCollisionObj(model, margin=margin, weight=weight, hard=False)],
+            "hard": [SelfCollisionObj(model, margin=margin, weight=weight, hard=True)],
+        }
+        self.mode = mode
+
+    def cycle(self):
+        self.mode = self.NAMES[(self.NAMES.index(self.mode) + 1) % len(self.NAMES)]
+        return self.mode
+
+    @property
+    def current(self):
+        return self.objectives[self.mode]
 
 
 class RealtimeVisualizer:
@@ -321,13 +364,105 @@ class RealtimeVisualizer:
         self.plotter.view_xy()
         self.plotter.reset_camera()
         self._opened = False
+        self.collision = None
+        self._angles = angles
+
+    # --- collision proxies -------------------------------------------------
+
+    def attach_collision(self, modes: CollisionModes, show: bool = True):
+        """Show the collision proxies (low-res envelopes enclosing each
+        link), red where a link is inside the margin of another. 'c' toggles
+        them, 'm' cycles the collision mode off/soft/hard."""
+        import jax
+
+        pv = self.pv
+        model = modes.model
+        self.collision = modes
+        self._clearances = jax.jit(lambda q: model.clearances(q, self.fk_solver))
+        parts, link_of_point, faces, offset = [], [], [], 0
+        for i, link in enumerate(model.links):
+            if link.envelope is None:
+                continue
+            v, f = link.envelope
+            parts.append((i, v))
+            link_of_point.append(np.full(len(v), i))
+            faces.append(np.hstack([np.full((len(f), 1), 3), f + offset]))
+            offset += len(v)
+        self._envelope_parts = parts
+        self._envelope_link = np.concatenate(link_of_point) if parts else np.zeros(0, int)
+        self.envelope = None
+        if parts:
+            points = np.concatenate([v for _, v in parts])
+            self.envelope = pv.PolyData(points, np.concatenate(faces).astype(np.int64))
+            self.envelope["hit"] = np.zeros(len(points))
+            self._envelope_actor = self.plotter.add_mesh(
+                self.envelope,
+                scalars="hit",
+                cmap=["mediumseagreen", "crimson"],
+                clim=[0, 1],
+                opacity=0.25,
+                show_scalar_bar=False,
+            )
+            self._envelope_actor.SetVisibility(show)
+            self.plotter.add_key_event("c", self._toggle_envelope)
+        self._update_collision(self._angles)
+
+    def _toggle_envelope(self):
+        actor = self._envelope_actor
+        actor.SetVisibility(not actor.GetVisibility())
+        self.plotter.render()
+
+    def _update_collision(self, angles):
+        modes = self.collision
+        clear = np.asarray(self._clearances(np.asarray(angles, np.float32)))
+        self.min_clearance = float(clear.min()) if len(clear) else float("inf")
+        if self.envelope is None:
+            return
+        hit = np.zeros(len(modes.model.links))
+        for (i, j), c in zip(modes.model.pairs, clear):
+            if c < modes.margin:
+                hit[i] = hit[j] = 1.0
+        fk = np.asarray(self.fk_solver.compute_fk_from_angles(np.asarray(angles, np.float32)))
+        names = self.fk_solver.bone_names
+        moved = []
+        for i, v in self._envelope_parts:
+            T = fk[names.index(modes.model.links[i].name)]
+            moved.append(v @ T[:3, :3].T + T[:3, 3])
+        self.envelope.points = np.concatenate(moved)
+        self.envelope["hit"] = hit[self._envelope_link]
+
+    def collision_status(self) -> str:
+        if self.collision is None:
+            return ""
+        state = "COLLIDING" if self.min_clearance < 0 else (
+            "inside margin" if self.min_clearance < self.collision.margin else "clear"
+        )
+        return (
+            f"collision: {self.collision.mode} (margin {self.collision.margin * 1000:.0f} mm)"
+            f"   min clearance {self.min_clearance * 1000:.1f} mm, {state}\n"
+            "keys: m = cycle collision mode, c = show/hide proxies\n"
+        )
+
+    def _bind_mode_key(self, apply):
+        if self.collision is None:
+            return
+
+        def cycle():
+            apply(self.collision.cycle())
+
+        self.plotter.add_key_event("m", cycle)
+
+    # --- posing -----------------------------------------------------------
 
     def set_pose(self, angles) -> None:
+        self._angles = np.asarray(angles, dtype=np.float32)
         verts, heads = self.poser.pose(angles)
         if self.mesh is not None:
             self.mesh.points = verts
         if self.skeleton is not None:
             self.skeleton.points = heads
+        if self.collision is not None:
+            self._update_collision(angles)
 
     def set_status(self, text: str) -> None:
         self.status.set_text("upper_left", text)
@@ -342,9 +477,12 @@ class RealtimeVisualizer:
         self.set_pose(angles)
         self.plotter.update()
 
+    # --- run modes ----------------------------------------------------------
+
     def run_interactive(self, controller: IKController, fps: float = 60.0) -> None:
         """Blocking: one draggable target sphere per end-effector; IK is
-        solved every frame towards the current sphere positions.
+        solved towards the current sphere positions in a background thread,
+        so the window stays responsive while a solve runs.
         """
         targets = controller.end_effector_positions()
         radius = 0.015 * self.scale
@@ -362,41 +500,62 @@ class RealtimeVisualizer:
                 interaction_event="always",
             )
 
-        last = {"time": time.perf_counter(), "solve_ms": 0.0}
+        if self.collision is not None:
+            controller.extra_objectives = self.collision.current
+
+            def apply(mode):
+                controller.extra_objectives = self.collision.current
+                last["targets"] = None  # re-solve with the new mode
+
+            self._bind_mode_key(apply)
+
+        worker = ThreadPoolExecutor(max_workers=1)
+        last = {"solve_ms": 0.0, "future": None, "targets": None, "loss": float("inf")}
+
+        def solve(current):
+            start = time.perf_counter()
+            angles = controller.step(current)
+            return angles, (time.perf_counter() - start) * 1000.0
 
         def tick(_step=None):
+            future = last["future"]
+            if future is not None:
+                if not future.done():
+                    return
+                angles, solve_ms = future.result()
+                last["future"] = None
+                last["solve_ms"] = 0.8 * last["solve_ms"] + 0.2 * solve_ms
+                self.set_pose(angles)
+                self.set_status(
+                    f"solve {last['solve_ms']:.1f} ms   loss {controller.loss:.2e}\n"
+                    + self.collision_status()
+                    + "drag the spheres to move the targets"
+                )
+                self.plotter.render()
+
             # Nothing to do while the targets sit still and the pose has
             # settled (reached, or stopped improving on an unreachable target)
             current = [np.array(t) for t in targets]
-            unchanged = last.get("targets") is not None and all(
+            unchanged = last["targets"] is not None and all(
                 np.array_equal(a, b) for a, b in zip(current, last["targets"])
             )
-            settled = controller.loss < 1e-6 or controller.loss >= 0.999 * last.get(
-                "loss", float("inf")
-            )
+            settled = controller.loss < 1e-6 or controller.loss >= 0.999 * last["loss"]
             if unchanged and settled:
                 return
             last["targets"] = current
             last["loss"] = controller.loss
-            start = time.perf_counter()
-            angles = controller.step(targets)
-            solve_ms = (time.perf_counter() - start) * 1000.0
-            last["solve_ms"] = 0.9 * last["solve_ms"] + 0.1 * solve_ms
-            self.set_pose(angles)
-            self.set_status(
-                f"solve {last['solve_ms']:.1f} ms   loss {controller.loss:.2e}\n"
-                "drag the spheres to move the targets"
-            )
-            self.plotter.render()
+            last["future"] = worker.submit(solve, current)
 
         # Compile before the window opens so the first drag isn't a stall
         print("Compiling IK solver...")
+        tick()
+        last["future"].result()
         tick()
         self.plotter.add_timer_event(
             max_steps=2**31 - 1, duration=max(1, int(1000 / fps)), callback=tick
         )
         self.plotter.show()
-
+        worker.shutdown(wait=False, cancel_futures=True)
 
     def run_trajectory(
         self,
@@ -407,7 +566,9 @@ class RealtimeVisualizer:
     ) -> None:
         """Blocking: every `interval` seconds pick new random reachable
         targets, plan a trajectory to them and play it back over `playback`
-        seconds. The planned end-effector paths are drawn as lines.
+        seconds. The next trajectory is planned in the background while the
+        current one plays; if planning takes longer, the model waits for it.
+        The planned end-effector paths are drawn as lines.
         """
         pv = self.pv
         playback = min(playback, interval)
@@ -430,46 +591,73 @@ class RealtimeVisualizer:
             )
             paths.append(path)
 
-        state = {"n": 0}
+        if self.collision is not None:
+            planner.extra_objectives = self.collision.current
 
-        def new_targets():
+            def apply(mode):
+                planner.extra_objectives = self.collision.current
+
+            self._bind_mode_key(apply)
+
+        worker = ThreadPoolExecutor(max_workers=1)
+        state = {"n": 0, "dist": 0.0, "future": None, "since": None}
+
+        def start_planning():
             targets = planner.random_targets()
-            planner.plan(targets)
+            start = planner.trajectory[-1].copy()
+            state["future"] = worker.submit(
+                lambda: (targets, planner.solve_trajectory(start, targets))
+            )
+
+        def install(result):
+            targets, (traj, loss, steps, ms) = result
+            planner.trajectory, planner.loss, planner.steps, planner.solve_ms = (
+                traj,
+                loss,
+                steps,
+                ms,
+            )
             for (marker, base), target in zip(markers, targets):
                 marker.points = base + target
             for path, points in zip(paths, planner.end_effector_paths()):
                 path.points = points
                 path.lines = np.hstack([[len(points)], np.arange(len(points))])
-            final = planner.end_effector_paths(planner.trajectory[-1:])
+            final = planner.end_effector_paths(traj[-1:])
             state.update(
                 since=time.perf_counter(),
                 n=state["n"] + 1,
                 dist=max(np.linalg.norm(f[0] - t) for f, t in zip(final, targets)),
             )
+            # Plan the next one while this one plays
+            start_planning()
 
         def tick(_step=None):
             elapsed = time.perf_counter() - state["since"]
-            if elapsed >= interval:
-                new_targets()
+            if elapsed >= interval and state["future"].done():
+                install(state["future"].result())
                 elapsed = 0.0
             u = elapsed / playback if playback > 0 else 1.0
             self.set_pose(planner.sample(u))
+            waiting = elapsed >= interval
             self.set_status(
-                f"target #{state['n']}   next in {interval - elapsed:.1f}s\n"
-                f"{planner.ik_points} trajectory points, smoothing {planner.smoothing}, "
+                f"target #{state['n']}   "
+                + ("planning the next trajectory..." if waiting else f"next in {interval - elapsed:.1f}s")
+                + f"\n{planner.ik_points} trajectory points, smoothing {planner.smoothing}, "
                 f"frame {min(u, 1.0) * planner.ik_points:.1f}/{planner.ik_points}\n"
-                f"solved in {planner.solve_ms:.1f} ms ({planner.steps} steps), "
-                f"final distance {state['dist'] * 1000:.1f} mm"
+                f"solved in {planner.solve_ms:.0f} ms ({planner.steps} steps), "
+                f"final distance {state['dist'] * 1000:.1f} mm\n" + self.collision_status()
             )
             self.plotter.render()
 
         print("Compiling IK solver...")
-        new_targets()
+        start_planning()
+        install(state["future"].result())
         tick()
         self.plotter.add_timer_event(
             max_steps=2**31 - 1, duration=max(1, int(1000 / fps)), callback=tick
         )
         self.plotter.show()
+        worker.shutdown(wait=False, cancel_futures=True)
 
 
 def _smplx_preset(fk_solver: FKSolver, hand: str):
@@ -524,8 +712,8 @@ def main(argv=None) -> None:
         "--num_steps",
         type=int,
         default=None,
-        help="Max IK steps per solve. Default 100 per frame when dragging, "
-        "1000 per trajectory with --random_targets",
+        help="Max IK steps per solve. Default 100 per frame when dragging (30 "
+        "with --collision), 1000 per trajectory with --random_targets",
     )
     parser.add_argument(
         "--random_targets",
@@ -549,6 +737,35 @@ def main(argv=None) -> None:
         type=float,
         default=2.0,
         help="Seconds to play each trajectory (--random_targets)",
+    )
+    parser.add_argument(
+        "--collision",
+        choices=["off", "soft", "hard"],
+        default="off",
+        help="Self-collision handling (cycle live with the 'm' key)",
+    )
+    parser.add_argument(
+        "--collision_margin",
+        type=float,
+        default=0.005,
+        help="Clearance to keep between links, meters",
+    )
+    parser.add_argument(
+        "--collision_resolution",
+        type=float,
+        default=0.01,
+        help="Collision proxy resolution, meters (smaller is tighter, slower to build)",
+    )
+    parser.add_argument(
+        "--collision_weight",
+        type=float,
+        default=None,
+        help="Collision penalty weight (default 100 soft, 1000 hard)",
+    )
+    parser.add_argument(
+        "--hide_collision",
+        action="store_true",
+        help="Start with the collision proxies hidden ('c' toggles)",
     )
     parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--no_mesh", action="store_true", help="Only draw the skeleton")
@@ -591,7 +808,9 @@ def main(argv=None) -> None:
         controlled_bones=controlled,
         bounds=bounds,
         threshold=1e-6,
-        num_steps=args.num_steps or (1000 if trajectory_mode else 100),
+        # Collision-aware frames cost more, warm starts keep few steps enough
+        num_steps=args.num_steps
+        or (1000 if trajectory_mode else (30 if args.collision != "off" else 100)),
         compute_sdf=False,
     )
     initial = None
@@ -604,6 +823,20 @@ def main(argv=None) -> None:
         show_mesh=not args.no_mesh,
         title=f"JAX-IK - {pathlib.Path(args.model_file).name}",
     )
+    if args.collision != "off":
+        from jax_ik.collision import CollisionModel
+
+        print("Building collision model (cached after the first run)...")
+        model = CollisionModel.cached(
+            solver.fk_solver,
+            resolution=args.collision_resolution,
+            lower=solver.lower_bounds if is_urdf else None,
+            upper=solver.upper_bounds if is_urdf else None,
+        )
+        modes = CollisionModes(
+            model, args.collision_margin, args.collision, args.collision_weight
+        )
+        viz.attach_collision(modes, show=not args.hide_collision)
     if trajectory_mode:
         planner = TrajectoryPlanner(
             solver,
