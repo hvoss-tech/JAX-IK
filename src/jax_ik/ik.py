@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import threading
 import time
 from functools import partial
 
@@ -337,6 +338,7 @@ class _LastFrameFKCache:
 
 _MANDATORY_POOL = []
 _OPTIONAL_POOL = []
+_SOLVE_LOCK = threading.Lock()
 
 # Number of initial steps (per solve) where gd_step's cautious mask is
 # forced to all-ones instead of the usual (m_hat * grad > 0) gate -- see
@@ -455,51 +457,55 @@ def solve_ik(
     # _solve_ik_core can gate convergence on mandatory-only loss.
     has_mandatory = len(mandatory_obj_fns) > 0
 
-    static_mandatory = _populate(_MANDATORY_POOL, mandatory_obj_fns)
-    static_optional = _populate(_OPTIONAL_POOL, optional_obj_fns)
-    # Hard constraints (e.g. SelfCollisionObj(hard=True)) are passed in either
-    # list like any objective; their penalty is part of the loss as usual and
-    # the solver additionally never lets their violation grow
-    constraints = tuple(
-        fn
-        for fn in (*static_mandatory, *static_optional)
-        if getattr(fn, "is_hard_constraint", False)
-    )
-
-    if mask is None:
-        mask = np.concatenate(
-            [np.zeros(init_rot.shape[0] - 1, dtype=bool), np.ones(1, dtype=bool)],
-            axis=0,
+    # The pools are shared: filling them and handing them to the jitted
+    # solver must not interleave with another thread's solve. The solve
+    # itself runs after dispatch, outside the lock
+    with _SOLVE_LOCK:
+        static_mandatory = _populate(_MANDATORY_POOL, mandatory_obj_fns)
+        static_optional = _populate(_OPTIONAL_POOL, optional_obj_fns)
+        # Hard constraints (e.g. SelfCollisionObj(hard=True)) are passed in either
+        # list like any objective; their penalty is part of the loss as usual and
+        # the solver additionally never lets their violation grow
+        constraints = tuple(
+            fn
+            for fn in (*static_mandatory, *static_optional)
+            if getattr(fn, "is_hard_constraint", False)
         )
-    else:
-        mask = np.asarray(mask, dtype=bool)
 
-    free_indices = np.where(mask)[0].astype(np.int32)
+        if mask is None:
+            mask = np.concatenate(
+                [np.zeros(init_rot.shape[0] - 1, dtype=bool), np.ones(1, dtype=bool)],
+                axis=0,
+            )
+        else:
+            mask = np.asarray(mask, dtype=bool)
 
-    return _solve_ik_core(
-        init_rot,
-        lower_bounds,
-        upper_bounds,
-        static_mandatory,
-        static_optional,
-        fksolver,
-        threshold=threshold,
-        num_steps=num_steps,
-        learning_rate=learning_rate,
-        beta1=beta1,
-        beta2=beta2,
-        epsilon=epsilon,
-        patience=patience,
-        has_mandatory=has_mandatory,
-        free_indices=free_indices,
-        constraint_fns=constraints,
-    )
+        free_indices = np.where(mask)[0].astype(np.int32)
+
+        return _solve_ik_core(
+            init_rot,
+            lower_bounds,
+            upper_bounds,
+            static_mandatory,
+            static_optional,
+            fksolver,
+            threshold=threshold,
+            num_steps=num_steps,
+            learning_rate=learning_rate,
+            beta1=beta1,
+            beta2=beta2,
+            epsilon=epsilon,
+            patience=patience,
+            has_mandatory=has_mandatory,
+            free_indices=free_indices,
+            constraint_fns=constraints,
+        )
 
 
 # Hard constraints are checked every _CHECK_EVERY steps (and on the result);
 # a failed check bisects back towards the last feasible checkpoint, at most
 # _MAX_BISECT halvings deep
-_CHECK_EVERY = 8
+_CHECK_EVERY = 32
 _MAX_BISECT = 6
 # How close to its limit a hard constraint counts as blocking when sliding
 # along it (meters for collision clearances)
@@ -836,7 +842,10 @@ def _solve_ik_core(
     if has_constraints:
         # The last steps since the final checkpoint haven't been checked yet
         x_safe, v_safe = _cp
-        best_free, _, _ = slide_back(x_safe, v_safe, best_free)
+        fine = jnp.sum(violations(best_free)) <= jnp.sum(v_safe)
+        best_free = jax.lax.cond(
+            fine, lambda x: x, lambda x: slide_back(x_safe, v_safe, x)[0], best_free
+        )
 
     final_traj = X_full.at[free_indices].set(best_free)
     best_metric = best_mand if has_mandatory else best_total

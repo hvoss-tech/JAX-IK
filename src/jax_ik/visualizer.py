@@ -15,6 +15,7 @@ Two ways to use it:
 import argparse
 import pathlib
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
@@ -290,12 +291,18 @@ class TrajectoryPlanner:
 
 
 class CollisionModes:
-    """The objectives for each self-collision mode, cycled with the 'm' key."""
+    """The objectives for each collision mode, cycled with the 'm' key.
+
+    With `obstacles` (keyword arguments of ObstacleCollisionObj, e.g.
+    floor=..., spheres=[(center, radius), ...]) the links are also kept off
+    a floor plane and out of spheres, each of which can be switched on and
+    off live (toggle_obstacle).
+    """
 
     NAMES = ("off", "soft", "hard")
 
-    def __init__(self, model, margin=0.005, mode="hard", weight=None):
-        from jax_ik.collision import SelfCollisionObj
+    def __init__(self, model, margin=0.005, mode="hard", weight=None, obstacles=None):
+        from jax_ik.collision import ObstacleCollisionObj, SelfCollisionObj
 
         self.model = model
         self.margin = float(margin)
@@ -304,7 +311,45 @@ class CollisionModes:
             "soft": [SelfCollisionObj(model, margin=margin, weight=weight, hard=False)],
             "hard": [SelfCollisionObj(model, margin=margin, weight=weight, hard=True)],
         }
+        self.obstacles = None
+        if obstacles is not None:
+            self.obstacles = {
+                name: ObstacleCollisionObj(model, margin=margin, hard=name == "hard", **obstacles)
+                for name in ("soft", "hard")
+            }
+            for name, obj in self.obstacles.items():
+                self.objectives[name].append(obj)
         self.mode = mode
+
+    @property
+    def obstacle(self):
+        """An ObstacleCollisionObj holding the current obstacle state."""
+        return None if self.obstacles is None else self.obstacles["hard"]
+
+    def obstacle_names(self) -> list:
+        o = self.obstacle
+        if o is None:
+            return []
+        return ["floor"] + [f"sphere {i + 1}" for i in range(len(o.sphere_radii))]
+
+    def obstacle_on(self, index: int) -> bool:
+        o = self.obstacle
+        return bool(o.floor_on > 0) if index == 0 else bool(o.sphere_on[index - 1] > 0)
+
+    def toggle_obstacle(self, index: int) -> bool:
+        """Switch obstacle `index` (0 = floor, 1.. = spheres) on or off in
+        every mode; returns whether it is on now."""
+        on = not self.obstacle_on(index)
+        for o in self.obstacles.values():
+            # New arrays rather than in-place edits: a solve running in the
+            # background keeps the state it started with
+            if index == 0:
+                o.floor_on = np.asarray(on, np.float32)
+            else:
+                flags = o.sphere_on.copy()
+                flags[index - 1] = on
+                o.sphere_on = flags
+        return on
 
     def cycle(self):
         self.mode = self.NAMES[(self.NAMES.index(self.mode) + 1) % len(self.NAMES)]
@@ -405,7 +450,61 @@ class RealtimeVisualizer:
             )
             self._envelope_actor.SetVisibility(show)
             self.plotter.add_key_event("c", self._toggle_envelope)
+        if modes.obstacles is not None:
+            self._attach_obstacles()
         self._update_collision(self._angles)
+
+    # Floor colors: collision on, off, something inside the margin
+    _FLOOR_COLORS = {"on": (0.86, 0.83, 0.77), "off": (0.93, 0.93, 0.93), "hit": (0.95, 0.72, 0.70)}
+    # Direction the light (and so the arm's shadow) falls in
+    _LIGHT = np.array([0.25, -1.0, 0.15])
+
+    def _attach_obstacles(self):
+        """Floor plane with the arm's shadow, and the spheres; number keys
+        and 'g' switch them on and off."""
+        pv = self.pv
+        modes = self.collision
+        o = modes.obstacle
+        up = np.asarray(o.up, np.float64)
+        self._clear_obstacles = jax.jit(lambda q, ob: jnp.min(ob.clearances(q, self.fk_solver), 1))
+        base = up * float(o.floor_height)
+        size = 2.5 * self.scale
+        self.floor = pv.Plane(center=base, direction=up, i_size=size, j_size=size)
+        self._floor_actor = self.plotter.add_mesh(
+            self.floor, color=self._FLOOR_COLORS["on"], ambient=0.3, diffuse=0.7
+        )
+        # Shadow: the arm squashed onto the floor along the light direction,
+        # a hair above it so it is drawn on top
+        light = self._LIGHT / np.linalg.norm(self._LIGHT)
+        self._shadow_plane = (up, float(o.floor_height) + 1e-3, light)
+        self.shadow = None
+        if self.mesh is not None:
+            self.shadow = pv.PolyData(self._project_shadow(np.asarray(self.mesh.points)), self.mesh.faces)
+            self._shadow_actor = self.plotter.add_mesh(self.shadow, color="gray", lighting=False)
+        self._sphere_actors = []
+        for c, r in zip(np.asarray(o.sphere_centers), np.asarray(o.sphere_radii)):
+            sphere = pv.Sphere(radius=float(r), center=c, theta_resolution=48, phi_resolution=48)
+            actor = self.plotter.add_mesh(sphere, color="steelblue", smooth_shading=True, specular=0.3)
+            shadow = pv.PolyData(self._project_shadow(np.asarray(sphere.points)), sphere.faces)
+            shadow_actor = self.plotter.add_mesh(shadow, color="gray", lighting=False)
+            self._sphere_actors.append((actor, shadow_actor))
+
+        def toggle(index):
+            modes.toggle_obstacle(index)
+            changed = getattr(self, "_collision_changed", None)
+            if changed is not None:
+                changed()
+            self._update_collision(self._angles)
+            self.plotter.render()
+
+        self.plotter.add_key_event("g", lambda: toggle(0))
+        for i in range(len(self._sphere_actors)):
+            self.plotter.add_key_event(str(i + 1), lambda i=i: toggle(i + 1))
+
+    def _project_shadow(self, points):
+        up, height, light = self._shadow_plane
+        t = (points @ up - height) / (light @ up)
+        return points - t[:, None] * light
 
     def _toggle_envelope(self):
         actor = self._envelope_actor
@@ -416,6 +515,8 @@ class RealtimeVisualizer:
         modes = self.collision
         clear = np.asarray(self._clearances(np.asarray(angles, np.float32)))
         self.min_clearance = float(clear.min()) if len(clear) else float("inf")
+        if modes.obstacles is not None and hasattr(self, "_floor_actor"):
+            self._update_obstacles(angles)
         if self.envelope is None:
             return
         hit = np.zeros(len(modes.model.links))
@@ -431,6 +532,38 @@ class RealtimeVisualizer:
         self.envelope.points = np.concatenate(moved)
         self.envelope["hit"] = hit[self._envelope_link]
 
+    def _update_obstacles(self, angles):
+        modes = self.collision
+        clear = np.asarray(self._clear_obstacles(np.asarray(angles, np.float32), modes.obstacle))
+        self.obstacle_clearance = clear
+        hit = clear < modes.margin
+        floor = "hit" if hit[0] else ("on" if modes.obstacle_on(0) else "off")
+        color = np.asarray(self._FLOOR_COLORS[floor])
+        self._floor_actor.prop.color = color
+        shadow = color * 0.86
+        if self.shadow is not None:
+            self.shadow.points = self._project_shadow(np.asarray(self.mesh.points))
+            self._shadow_actor.prop.color = shadow
+        for i, (actor, shadow_actor) in enumerate(self._sphere_actors):
+            on = modes.obstacle_on(i + 1)
+            actor.prop.color = "crimson" if hit[i + 1] else "steelblue"
+            actor.prop.opacity = 0.9 if on else 0.15
+            shadow_actor.SetVisibility(on)
+            shadow_actor.prop.color = shadow
+
+    def obstacle_status(self) -> str:
+        modes = self.collision
+        if modes is None or modes.obstacles is None or not hasattr(self, "obstacle_clearance"):
+            return ""
+        parts = []
+        for i, name in enumerate(modes.obstacle_names()):
+            key = "g" if i == 0 else str(i)
+            if modes.obstacle_on(i):
+                parts.append(f"{name} ({key}): {self.obstacle_clearance[i] * 1000:.0f} mm")
+            else:
+                parts.append(f"{name} ({key}): off")
+        return "obstacles   " + "   ".join(parts) + "\n"
+
     def collision_status(self) -> str:
         if self.collision is None:
             return ""
@@ -440,7 +573,10 @@ class RealtimeVisualizer:
         return (
             f"collision: {self.collision.mode} (margin {self.collision.margin * 1000:.0f} mm)"
             f"   min clearance {self.min_clearance * 1000:.1f} mm, {state}\n"
-            "keys: m = cycle collision mode, c = show/hide proxies\n"
+            + self.obstacle_status()
+            + "keys: m = cycle collision mode, c = show/hide proxies"
+            + (", g / 1 / 2 ... = floor / spheres on/off" if self.collision.obstacles else "")
+            + "\n"
         )
 
     def _bind_mode_key(self, apply):
@@ -563,12 +699,24 @@ class RealtimeVisualizer:
         interval: float = 5.0,
         playback: float = 2.0,
         fps: float = 60.0,
+        max_miss: float = None,
+        max_retries: int = 20,
+        buffer: int = 2,
+        candidates: int = 1,
     ) -> None:
         """Blocking: every `interval` seconds pick new random reachable
         targets, plan a trajectory to them and play it back over `playback`
-        seconds. The next trajectory is planned in the background while the
-        current one plays; if planning takes longer, the model waits for it.
-        The planned end-effector paths are drawn as lines.
+        seconds. Trajectories are planned in the background, each starting
+        where the previous one ends, so up to `buffer` of them are ready to
+        play right away; if planning falls behind, the model waits.
+        `candidates` plans to different targets run in parallel for each
+        next one, and the first that is good enough is taken. Changing the
+        collision mode or obstacles drops the buffered ones. The planned
+        end-effector paths are drawn as lines.
+
+        With `max_miss` (meters), a plan ending further than that from its
+        targets is dropped and new targets are planned instead, up to
+        `max_retries` times in a row (then the plan is used anyway).
         """
         pv = self.pv
         playback = min(playback, interval)
@@ -591,26 +739,85 @@ class RealtimeVisualizer:
             )
             paths.append(path)
 
+        worker = ThreadPoolExecutor(max_workers=candidates)
+        state = {
+            "n": 0,
+            "dist": 0.0,
+            "since": None,
+            # Accepted plans waiting to be played, as (targets, solve result)
+            "queue": deque(),
+            # Plans being solved, as (future, slot): only those for the
+            # current slot (the next plan after the queue) can still be used
+            "pending": [],
+            "slot": 0,
+            "retries": 0,
+        }
+
+        def flush():
+            """Collision mode or obstacles changed: plans made for the old
+            setup are dropped and planning restarts from the current one."""
+            state["queue"].clear()
+            state["slot"] += 1
+            state["retries"] = 0
+
         if self.collision is not None:
             planner.extra_objectives = self.collision.current
 
             def apply(mode):
                 planner.extra_objectives = self.collision.current
+                flush()
 
             self._bind_mode_key(apply)
+            self._collision_changed = flush
 
-        worker = ThreadPoolExecutor(max_workers=1)
-        state = {"n": 0, "dist": 0.0, "future": None, "since": None}
+        def miss(targets, traj):
+            final = planner.end_effector_paths(traj[-1:])
+            return max(np.linalg.norm(f[0] - t) for f, t in zip(final, targets))
 
-        def start_planning():
-            targets = planner.random_targets()
-            start = planner.trajectory[-1].copy()
-            state["future"] = worker.submit(
-                lambda: (targets, planner.solve_trajectory(start, targets))
-            )
+        def chain_start():
+            """Where the next plan starts: the end of the last buffered plan,
+            or of the one playing."""
+            queue = state["queue"]
+            return (queue[-1][1][0] if queue else planner.trajectory)[-1].copy()
 
-        def install(result):
-            targets, (traj, loss, steps, ms) = result
+        def keep_planning():
+            """Collect finished background plans: the first one for the
+            current slot that reaches its targets joins the queue, the rest
+            are dropped. Then keep `candidates` plans (different targets
+            from the same start) running while the buffer isn't full."""
+            running = []
+            for future, slot in state["pending"]:
+                if not future.done():
+                    running.append((future, slot))
+                    continue
+                if slot != state["slot"]:
+                    continue
+                targets, result = future.result()
+                missed = (
+                    max_miss is not None
+                    and state["retries"] < max_retries
+                    and miss(targets, result[0]) > max_miss
+                )
+                if missed:
+                    state["retries"] += 1
+                else:
+                    state["retries"] = 0
+                    state["queue"].append((targets, result))
+                    state["slot"] += 1
+            state["pending"] = running
+            if len(state["queue"]) >= buffer:
+                return
+            start = chain_start()
+            current = sum(slot == state["slot"] for _, slot in running)
+            for _ in range(candidates - current):
+                targets = planner.random_targets()
+                future = worker.submit(
+                    lambda targets=targets: (targets, planner.solve_trajectory(start, targets))
+                )
+                state["pending"].append((future, state["slot"]))
+
+        def install(plan):
+            targets, (traj, loss, steps, ms) = plan
             planner.trajectory, planner.loss, planner.steps, planner.solve_ms = (
                 traj,
                 loss,
@@ -622,19 +829,14 @@ class RealtimeVisualizer:
             for path, points in zip(paths, planner.end_effector_paths()):
                 path.points = points
                 path.lines = np.hstack([[len(points)], np.arange(len(points))])
-            final = planner.end_effector_paths(traj[-1:])
-            state.update(
-                since=time.perf_counter(),
-                n=state["n"] + 1,
-                dist=max(np.linalg.norm(f[0] - t) for f, t in zip(final, targets)),
-            )
-            # Plan the next one while this one plays
-            start_planning()
+            state.update(since=time.perf_counter(), n=state["n"] + 1, dist=miss(targets, traj))
 
         def tick(_step=None):
+            keep_planning()
             elapsed = time.perf_counter() - state["since"]
-            if elapsed >= interval and state["future"].done():
-                install(state["future"].result())
+            if elapsed >= interval and state["queue"]:
+                install(state["queue"].popleft())
+                keep_planning()
                 elapsed = 0.0
             u = elapsed / playback if playback > 0 else 1.0
             self.set_pose(planner.sample(u))
@@ -642,6 +844,7 @@ class RealtimeVisualizer:
             self.set_status(
                 f"target #{state['n']}   "
                 + ("planning the next trajectory..." if waiting else f"next in {interval - elapsed:.1f}s")
+                + f"   {len(state['queue'])} planned ahead"
                 + f"\n{planner.ik_points} trajectory points, smoothing {planner.smoothing}, "
                 f"frame {min(u, 1.0) * planner.ik_points:.1f}/{planner.ik_points}\n"
                 f"solved in {planner.solve_ms:.0f} ms ({planner.steps} steps), "
@@ -650,8 +853,10 @@ class RealtimeVisualizer:
             self.plotter.render()
 
         print("Compiling IK solver...")
-        start_planning()
-        install(state["future"].result())
+        while not state["queue"]:
+            keep_planning()
+            time.sleep(0.01)
+        install(state["queue"].popleft())
         tick()
         self.plotter.add_timer_event(
             max_steps=2**31 - 1, duration=max(1, int(1000 / fps)), callback=tick

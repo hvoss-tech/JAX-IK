@@ -26,6 +26,8 @@ stays conservative either way.
 hard constraint the solver never lets get worse (see ik.solve_ik).
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -39,7 +41,7 @@ from jax_ik.objectives import ObjectiveFunction
 _SQRT3_2 = float(np.sqrt(3.0) / 2.0)
 _VIOLATION_TOL = 1e-6
 # Bump when the proxy format changes so stale caches are rebuilt
-_CACHE_VERSION = 2
+_CACHE_VERSION = 5
 
 
 class LinkProxy:
@@ -288,6 +290,11 @@ class CollisionModel:
         self.e_target = np.asarray(e_target, np.int32)
         self.e_pair = np.asarray(e_pair, np.int32)
         self.n_entries = len(e_chunk)
+        # Everything the narrow phase needs per entry, so a lookup gathers
+        # once per table instead of chaining index arrays
+        self.e_links = np.stack([self.chunk_link[self.e_chunk], self.e_target], 1).astype(np.int32)
+        self.e_points = self.chunk_points[self.e_chunk]
+        self.e_radii = self.chunk_radii[self.e_chunk]
 
     # --- runtime (jax) ----------------------------------------------------
 
@@ -322,8 +329,15 @@ class CollisionModel:
         # margin can't violate it, so only as many as are within it need the
         # exact check; pick the smallest size tier that fits
         if max_checks is not None and max_checks <= 64:
-            # Small fixed budget: always look up that many, no switch
-            entry_clear, penalty = self._narrow(Ts, gap, min(max_checks, self.n_entries), margin)
+            # Small fixed budget: look up that many, unless nothing is
+            # within the margin and the gaps already say all there is
+            k = min(max_checks, self.n_entries)
+            entry_clear, penalty = jax.lax.cond(
+                jnp.min(gap) < margin,
+                lambda g: self._narrow(Ts, g, k, margin),
+                lambda g: (g, jnp.float32(0.0)),
+                gap,
+            )
             clear = jax.ops.segment_min(entry_clear, self.e_pair, num_segments=P)
             return clear, penalty
 
@@ -339,6 +353,59 @@ class CollisionModel:
         clear = jax.ops.segment_min(entry_clear, self.e_pair, num_segments=P)
         return clear, penalty
 
+    def penalty(self, fk, fk_solver, margin, max_checks):
+        """Soft penalty for one pose from the `max_checks` closest entries:
+        the same value as evaluate(...)[1] with that budget, with its
+        gradient worked out alongside instead of by autodiff (much fewer
+        small ops per solver step)."""
+        if not self.pairs:
+            return jnp.float32(0.0)
+        bone_idx = np.asarray([fk_solver.bone_names.index(n) for n in self.link_names])
+        Ts = fk[bone_idx]
+        return _penalty(self, min(max_checks, self.n_entries), Ts, jnp.asarray(margin, jnp.float32))
+
+    def _penalty_and_grad(self, Ts, margin, k):
+        """(penalty, d penalty / d Ts) from the k entries with the smallest gap."""
+        gap = self._gaps(Ts)
+
+        def narrow(_):
+            _, sel = jax.lax.top_k(-gap, k)
+            links = jnp.asarray(self.e_links)[sel]
+            src, dst = links[:, 0], links[:, 1]
+            R, t = Ts[:, :3, :3], Ts[:, :3, 3]
+            Rs, Rd = R[src], R[dst] / self.spacing
+            ts, td = t[src], t[dst]
+            A = jnp.einsum("kji,kjl->kil", Rd, Rs)
+            b = jnp.einsum("kji,kj->ki", Rd, ts - td) - jnp.asarray(self.origins / self.spacing)[dst]
+            pts = jnp.asarray(self.e_points)[sel]
+            coords = jnp.einsum("kij,kmj->kmi", A, pts) + b[:, None, :]
+            d = self._trilinear(dst, coords) - jnp.asarray(self.e_radii)[sel]
+            d_min = jnp.min(d, axis=1)
+            # The min only has a gradient at each entry's deepest point
+            j = jnp.argmin(d, axis=1)[:, None, None]
+            p = jnp.take_along_axis(pts, j, axis=1)[:, 0]
+            _, g = self._trilinear(dst, jnp.take_along_axis(coords, j, axis=1), with_slope=True)
+            depth = jax.nn.relu(margin - d_min)
+            # Chain rule for d = grid(Rd^T (Rs p + ts - td) / spacing - origin)
+            # with slope g, scaled by d penalty / d d
+            g = -2.0 * depth[:, None] * g[:, 0]
+            n = jnp.einsum("kij,kj->ki", Rd, g)  # d / d world point
+            u = jnp.einsum("kij,kj->ki", Rs, p) + ts - td
+            Gs = jnp.concatenate([n[:, :, None] * p[:, None, :], n[:, :, None]], 2)
+            Gd = jnp.concatenate(
+                [u[:, :, None] * g[:, None, :] / self.spacing, -n[:, :, None]], 2
+            )
+            # Scatter onto the links as one matmul: (L, k) @ (k, 12)
+            onehot = jax.nn.one_hot(jnp.concatenate([src, dst]), Ts.shape[0], dtype=Ts.dtype)
+            G = (onehot.T @ jnp.concatenate([Gs, Gd]).reshape(2 * k, 12)).reshape(-1, 3, 4)
+            G = jnp.concatenate([G, jnp.zeros((G.shape[0], 1, 4), G.dtype)], 1)
+            return jnp.sum(depth**2), G
+
+        # Nothing within the margin: no penalty, no gradient
+        return jax.lax.cond(
+            jnp.min(gap) < margin, narrow, lambda _: (jnp.float32(0.0), jnp.zeros_like(Ts)), None
+        )
+
     def _gaps(self, Ts):
         """Broad-phase lower bound per entry: every chunk sphere against
         every link's volume spheres as one dense matrix (cheaper than
@@ -347,13 +414,15 @@ class CollisionModel:
         chunk_link = jnp.asarray(self.chunk_link)
         cc = jnp.einsum("kij,kj->ki", R[chunk_link], self.chunk_center) + t[chunk_link]
         bc = jnp.einsum("lij,lnj->lni", R, self.bound_centers) + t[:, None, :]
-        # |a - b|^2 = |a|^2 - 2ab + |b|^2: a matmul is much faster on CPU
-        # than broadcasting the differences
-        d2 = (
-            jnp.sum(cc * cc, axis=-1)[:, None, None]
-            - 2.0 * jnp.einsum("kj,lnj->kln", cc, bc)
-            + jnp.sum(bc * bc, axis=-1)[None]
-        )
+        bc = bc.reshape(-1, 3)
+        # |a - b|^2 = |a|^2 - 2ab + |b|^2 as a single matmul of augmented
+        # vectors: much faster on CPU than broadcasting the differences, and
+        # than a 3-wide matmul with the norms added afterwards
+        one_c = jnp.ones((cc.shape[0], 1), cc.dtype)
+        one_b = jnp.ones((bc.shape[0], 1), bc.dtype)
+        a = jnp.concatenate([cc, jnp.sum(cc * cc, -1, keepdims=True), one_c], 1)
+        b = jnp.concatenate([-2.0 * bc, one_b, jnp.sum(bc * bc, -1, keepdims=True)], 1)
+        d2 = (a @ b.T).reshape(cc.shape[0], *self.bound_radii.shape)
         dist = jnp.sqrt(jnp.maximum(d2, 0.0) + 1e-12) - self.bound_radii[None]
         chunk_gap = jnp.min(dist, axis=-1) - self.chunk_radius[:, None]  # (C, L)
         return chunk_gap[self.e_chunk, self.e_target] - self.gap_slack  # (E,)
@@ -366,30 +435,43 @@ class CollisionModel:
     def _narrow(self, Ts, gap, k, margin):
         """Exact grid lookups for the k entries with the smallest gap."""
         _, sel = jax.lax.top_k(-gap, k)
-        chunk = jnp.asarray(self.e_chunk)[sel]
-        src = jnp.asarray(self.chunk_link)[chunk]
-        dst = jnp.asarray(self.e_target)[sel]
-        rel = jnp.einsum("kij,kjl->kil", _rigid_inverse(Ts[dst]), Ts[src])
-        pts = jnp.einsum("kij,kmj->kmi", rel[:, :3, :3], jnp.asarray(self.chunk_points)[chunk])
-        pts = pts + rel[:, None, :3, 3]
-        coords = (pts - jnp.asarray(self.origins)[dst][:, None, :]) / self.spacing
-        d = self._trilinear(dst, coords) - jnp.asarray(self.chunk_radii)[chunk]  # (k, m)
-        # Entries that were not looked up keep their gap, also a lower bound
+        links = jnp.asarray(self.e_links)[sel]
+        src, dst = links[:, 0], links[:, 1]
+        R, t = Ts[:, :3, :3] / self.spacing, Ts[:, :3, 3]
+        Rd = R[dst]
+        # Straight to grid coordinates of dst:
+        # (Rd^T (Rs p + ts - td) - origin) / spacing
+        A = jnp.einsum("kji,kjl->kil", Rd, R[src]) * self.spacing
+        b = jnp.einsum("kji,kj->ki", Rd, t[src] - t[dst]) - jnp.asarray(self.origins / self.spacing)[dst]
+        pts, rad = jnp.asarray(self.e_points)[sel], jnp.asarray(self.e_radii)[sel]
+        A0, b0 = jax.lax.stop_gradient(A), jax.lax.stop_gradient(b)
+        coords = jnp.einsum("kij,kmj->kmi", A0, pts) + b0[:, None, :]
+        d = self._trilinear(dst, coords) - rad  # (k, m)
         d_min = jnp.min(d, axis=1)
+        # The min only has a gradient at each entry's deepest point, so only
+        # that point is differentiated (the value stays the exact min)
+        j = jnp.argmin(d, axis=1)
+        p = jnp.take_along_axis(pts, j[:, None, None], axis=1)
+        r = jnp.take_along_axis(rad, j[:, None], axis=1)[:, 0]
+        c = jnp.einsum("kij,kmj->kmi", A, p) + b[:, None, :]
+        d_j = self._trilinear(dst, c)[:, 0] - r
+        d_pen = d_min + (d_j - jax.lax.stop_gradient(d_j))
+        # Entries that were not looked up keep their gap, also a lower bound
         entry_clear = gap.at[sel].set(d_min)
         # Penalize each checked chunk's deepest point: summing every point
         # would scale with the point density and drown out other objectives
-        return entry_clear, jnp.sum(jax.nn.relu(margin - d_min) ** 2)
+        return entry_clear, jnp.sum(jax.nn.relu(margin - d_pen) ** 2)
 
-    def _trilinear(self, link, coords):
-        """Interpolate grid `link` (k,) at grid coordinates (k, m, 3).
+    def _trilinear(self, link, coords, with_slope=False):
+        """Interpolate grid `link` (k,) at grid coordinates (k, m, 3), and
+        with `with_slope` also return the gradient along the coordinates.
 
         Direct 8-corner lookup on the flattened grids: much cheaper to
         differentiate than map_coordinates over the stacked 4D array, which
         would also interpolate along the link axis.
         """
         X, Y, Z = self.grid_shape
-        dims = jnp.asarray([X, Y, Z])
+        dims = np.array([X, Y, Z])
         c0 = jnp.floor(coords)
         f = coords - c0
         i = c0.astype(jnp.int32)
@@ -397,13 +479,24 @@ class CollisionModel:
         i = jnp.clip(i, 0, dims - 2)
         base = link[:, None] * (X * Y * Z) + i[..., 0] * (Y * Z) + i[..., 1] * Z + i[..., 2]
         corners = np.array([[a, b, c] for a in (0, 1) for b in (0, 1) for c in (0, 1)])
-        offsets = jnp.asarray(corners @ np.array([Y * Z, Z, 1]))
+        offsets = (corners @ np.array([Y * Z, Z, 1])).astype(np.int32)
         vals = jnp.asarray(self.grids.reshape(-1))[base[..., None] + offsets]  # (k, m, 8)
-        w = jnp.where(corners[:, 0] == 1, f[..., 0:1], 1 - f[..., 0:1])
-        w = w * jnp.where(corners[:, 1] == 1, f[..., 1:2], 1 - f[..., 1:2])
-        w = w * jnp.where(corners[:, 2] == 1, f[..., 2:3], 1 - f[..., 2:3])
+        # Corners are ordered x-major: interpolate along z, then y, then x
+        fx, fy, fz = f[..., 0], f[..., 1:2], f[..., 2:3]
+        vz = vals[..., 0::2] * (1 - fz) + vals[..., 1::2] * fz
+        vy = vz[..., 0::2] * (1 - fy) + vz[..., 1::2] * fy
+        v = vy[..., 0] * (1 - fx) + vy[..., 1] * fx
         # Off the grid: at least the padding away from the mesh
-        return jnp.where(inside, jnp.sum(w * vals, axis=-1), self.outside)
+        v = jnp.where(inside, v, self.outside)
+        if not with_slope:
+            return v
+        lerp_x = lambda a: a[..., 0] * (1 - fx) + a[..., 1] * fx
+        dy = vz[..., 1::2] - vz[..., 0::2]
+        dz = vals[..., 1::2] - vals[..., 0::2]
+        dz = dz[..., 0::2] * (1 - fy) + dz[..., 1::2] * fy
+        slope = jnp.stack([vy[..., 1] - vy[..., 0], lerp_x(dy), lerp_x(dz)], -1)
+        # Off the grid the value is constant
+        return v, jnp.where(inside[..., None], slope, 0.0)
 
     def clearances(self, angles, fk_solver, margin=0.05):
         """Per-pair clearance lower bounds (meters) for one angle vector,
@@ -424,18 +517,28 @@ class CollisionModel:
         return out
 
 
-def _rigid_inverse(T):
-    R = T[..., :3, :3]
-    Rt = jnp.swapaxes(R, -1, -2)
-    t = -jnp.einsum("...ij,...j->...i", Rt, T[..., :3, 3])
-    inv = jnp.zeros_like(T).at[..., :3, :3].set(Rt).at[..., :3, 3].set(t)
-    return inv.at[..., 3, 3].set(1.0)
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+def _penalty(model, k, Ts, margin):
+    return model._penalty_and_grad(Ts, margin, k)[0]
+
+
+def _penalty_fwd(model, k, Ts, margin):
+    value, grad = model._penalty_and_grad(Ts, margin, k)
+    return value, (grad, margin)
+
+
+def _penalty_bwd(model, k, res, ct):
+    grad, margin = res
+    return ct * grad, jnp.zeros_like(margin)
+
+
+_penalty.defvjp(_penalty_fwd, _penalty_bwd)
 
 
 # --- proxy construction (numpy, offline) ----------------------------------
 
 
-def _build_proxy(name, mesh, resolution, chunk_size=32, n_bounds=16):
+def _build_proxy(name, mesh, resolution, chunk_size=32, n_bounds=8):
     h = resolution / 2.0
     # Off-grid points read as `pad` away, so margins up to about pad work
     pad = max(3 * resolution, 0.05)
@@ -733,18 +836,25 @@ class SelfCollisionObj(ObjectiveFunction):
         fk = fk_solver.compute_fk_from_angles(cfg)
         return self.model.evaluate(fk, fk_solver, margin, max_checks)
 
+    def _penalty(self, cfg, fk_solver, margin):
+        fk = fk_solver.compute_fk_from_angles(cfg)
+        return self.model.penalty(fk, fk_solver, margin, self.penalty_checks)
+
     def __call__(self, X, fk_solver):
         if not self.model.pairs:
             return jnp.float32(0.0)
+        reach = self.margin + self.influence
+        # Single pose after the fixed start: that pose is the last frame,
+        # whose FK the solver already computes for other objectives
+        shared = getattr(fk_solver, "shared_last_frame_cfg", None)
+        if X.ndim == 2 and X.shape[0] == 2 and shared is not None:
+            return self._penalty(shared, fk_solver, reach) * self.weight
         # Frame 0 of a trajectory is always the fixed start pose: its
         # penalty is a constant
         X = X[None] if X.ndim == 1 else (X[1:] if X.shape[0] > 1 else X)
-        reach = self.margin + self.influence
         # lax.map, not vmap: under vmap the narrow-phase size switch would
         # turn into computing every size for every frame
-        _, penalty = jax.lax.map(
-            lambda cfg: self._frame(cfg, fk_solver, reach, self.penalty_checks), X
-        )
+        penalty = jax.lax.map(lambda cfg: self._penalty(cfg, fk_solver, reach), X)
         return jnp.mean(penalty) * self.weight
 
     def check_poses(self, X):
@@ -772,4 +882,156 @@ class SelfCollisionObj(ObjectiveFunction):
         clear, _ = jax.lax.map(lambda cfg: self._frame(cfg, fk_solver, margin), poses)
         # A micrometer of slack so poses resting exactly on the margin don't
         # register float noise as violations
+        return jax.nn.relu(margin - clear - _VIOLATION_TOL).reshape(-1)
+
+
+@register_pytree_node_class
+class ObstacleCollisionObj(ObjectiveFunction):
+    """Keeps the model's links off a floor plane and out of spheres.
+
+    Uses the same proxies as SelfCollisionObj: every link's surface is
+    covered by sample points with radii, so a point's distance to an
+    obstacle minus its radius is a lower bound on the link's distance to
+    it. Soft and hard mode work as in SelfCollisionObj.
+
+    Obstacles can be switched on and off (`floor_on`, `sphere_on`) and
+    moved between solves without recompiling; only the number of spheres
+    is fixed.
+
+    Args:
+        model: CollisionModel of the solver's skeleton.
+        floor: Height of the floor plane along `up`, or None for no floor.
+        spheres: List of (center (3,), radius).
+        up: Floor normal (pointing into free space).
+        ignore_links: Links never checked, e.g. a base resting on the floor.
+        margin, weight, hard, influence, substeps: As in SelfCollisionObj.
+    """
+
+    def __init__(
+        self,
+        model,
+        floor=None,
+        spheres=(),
+        up=(0.0, 1.0, 0.0),
+        ignore_links=(),
+        margin=0.0,
+        weight=None,
+        hard=False,
+        influence=0.02,
+        substeps=2,
+    ):
+        self.model = model
+        self.ignore_links = tuple(ignore_links)
+        up = np.asarray(up, np.float32)
+        self.up = up / np.linalg.norm(up)
+        self.floor_height = np.asarray(0.0 if floor is None else floor, np.float32)
+        self.floor_on = np.asarray(floor is not None, np.float32)
+        spheres = list(spheres)
+        self.sphere_centers = np.asarray([c for c, _ in spheres], np.float32).reshape(-1, 3)
+        self.sphere_radii = np.asarray([r for _, r in spheres], np.float32).reshape(-1)
+        self.sphere_on = np.ones(len(spheres), np.float32)
+        self.margin = np.asarray(margin, np.float32)
+        if weight is None:
+            # Hard mode only needs a gentle push away: a stronger one makes
+            # the arm bounce off obstacles and stall far from them
+            weight = 10.0 if hard else 100.0
+        self.weight = np.asarray(weight, np.float32)
+        self.hard = bool(hard)
+        self.influence = np.asarray(influence if hard else 0.0, np.float32)
+        self.substeps = int(substeps)
+
+    @property
+    def is_hard_constraint(self):
+        return self.hard
+
+    def referenced_bones(self):
+        return tuple(n for n in self.model.link_names if n not in self.ignore_links)
+
+    _ARRAYS = (
+        "up",
+        "floor_height",
+        "floor_on",
+        "sphere_centers",
+        "sphere_radii",
+        "sphere_on",
+        "margin",
+        "weight",
+        "influence",
+    )
+    _STATIC = ("model", "ignore_links", "hard", "substeps")
+
+    def get_params(self):
+        return {k: getattr(self, k) for k in self._ARRAYS + self._STATIC}
+
+    def update_params(self, params):
+        for key in self._STATIC:
+            if key in params:
+                setattr(self, key, params[key])
+        for key in self._ARRAYS:
+            if key in params:
+                setattr(self, key, np.asarray(params[key], np.float32))
+
+    check_poses = SelfCollisionObj.check_poses
+
+    def _chunks(self):
+        """Indices of the point chunks on the checked links."""
+        m = self.model
+        return np.nonzero([m.links[i].name not in self.ignore_links for i in m.chunk_link])[0]
+
+    def _distances(self, points, obstacle):
+        """Distance from world points (O, ...) to obstacle o (0 = floor)."""
+        floor = points @ self.up - self.floor_height
+        centers = jnp.asarray(self.sphere_centers)[np.maximum(obstacle - 1, 0)]
+        radii = jnp.asarray(self.sphere_radii)[np.maximum(obstacle - 1, 0)]
+        shape = (-1,) + (1,) * (points.ndim - 2)
+        diff = points - centers.reshape(shape + (3,))
+        sphere = jnp.sqrt(jnp.sum(diff * diff, -1) + 1e-12) - radii.reshape(shape)
+        return jnp.where((obstacle == 0).reshape(shape), floor, sphere)
+
+    def clearances(self, cfg, fk_solver, checks=32):
+        """(1 + spheres, chunks) lower bounds on each point chunk's distance
+        to the floor and each sphere; switched-off obstacles read as far.
+
+        Every chunk gets its bounding sphere's distance, and the `checks`
+        closest per obstacle the exact distance of each of its points."""
+        m = self.model
+        chunks = self._chunks()
+        bone_idx = np.asarray([fk_solver.bone_names.index(n) for n in m.link_names])
+        Ts = fk_solver.compute_fk_from_angles(cfg)[bone_idx][m.chunk_link[chunks]]  # (C, 4, 4)
+        O = 1 + len(self.sphere_radii)
+        obstacle = np.arange(O)
+        centers = jnp.einsum("cij,cj->ci", Ts[:, :3, :3], m.chunk_center[chunks]) + Ts[:, :3, 3]
+        bound = self._distances(jnp.broadcast_to(centers, (O, *centers.shape)), obstacle)
+        bound = bound - m.chunk_radius[chunks]  # (O, C)
+        _, sel = jax.lax.top_k(-bound, min(checks, len(chunks)))  # (O, k)
+        T = Ts[sel]
+        pts = jnp.asarray(m.chunk_points[chunks])[sel]  # (O, k, m, 3)
+        world = jnp.einsum("okij,okmj->okmi", T[..., :3, :3], pts) + T[..., None, :3, 3]
+        exact = self._distances(world, obstacle) - jnp.asarray(m.chunk_radii[chunks])[sel]
+        clear = jax.vmap(lambda b, i, e: b.at[i].set(jnp.min(e, -1)))(bound, sel, exact)
+        on = jnp.concatenate([self.floor_on[None], self.sphere_on])
+        return jnp.where(on[:, None] > 0, clear, 1e3)
+
+    def __call__(self, X, fk_solver):
+        reach = self.margin + self.influence
+        shared = getattr(fk_solver, "shared_last_frame_cfg", None)
+        if X.ndim == 2 and X.shape[0] == 2 and shared is not None:
+            # Single pose: reuse the solver's FK of the last frame
+            clear = self.clearances(shared, fk_solver)[None]
+        else:
+            # Frame 0 of a trajectory is the fixed start pose
+            X = X[None] if X.ndim == 1 else (X[1:] if X.shape[0] > 1 else X)
+            clear = jax.vmap(lambda cfg: self.clearances(cfg, fk_solver))(X)
+        # Penalize each link's closest point per obstacle: summing every
+        # point would scale with the point density
+        link = self.model.chunk_link[self._chunks()]
+        L = len(self.model.links)
+        closest = jax.vmap(jax.vmap(lambda c: jax.ops.segment_min(c, link, num_segments=L)))(clear)
+        closest = jnp.minimum(closest, 1e3)  # links without points
+        return jnp.mean(jnp.sum(jax.nn.relu(reach - closest) ** 2, axis=(1, 2))) * self.weight
+
+    def violation(self, X, fk_solver, extra=0.0):
+        margin = self.margin + extra
+        poses = self.check_poses(X)
+        clear = jax.vmap(lambda cfg: jnp.min(self.clearances(cfg, fk_solver), axis=1))(poses)
         return jax.nn.relu(margin - clear - _VIOLATION_TOL).reshape(-1)
