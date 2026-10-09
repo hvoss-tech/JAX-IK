@@ -138,6 +138,21 @@ def tf_rotation_matrix_from_axis_angle(axis: jnp.ndarray, angle: float) -> jnp.n
     return R4
 
 
+def _matmul4(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    """Batched product of 4x4 matrices as four broadcast multiply-adds.
+
+    Same result as `a @ b`, but XLA fuses it (and its gradient) into plain
+    loops. As dot ops, or as a multiply-and-reduce, the tiny batched
+    products of the FK and its backward pass are each handed to the matmul
+    library and its thread pool, which costs far more than the arithmetic,
+    especially when FK is vmapped over the frames of a trajectory.
+    """
+    out = a[..., :, 0, None] * b[..., None, 0, :]
+    for k in range(1, 4):
+        out = out + a[..., :, k, None] * b[..., None, k, :]
+    return out
+
+
 # How a controlled bone's 3 parameters are interpreted, see _compute_fk_tf
 JOINT_EULER = 0
 JOINT_REVOLUTE = 1
@@ -239,7 +254,7 @@ def _compute_fk_tf(
     # parallel, instead of redoing `local @ rotation` inside each level's
     # step. That leaves only one (data-dependent) matmul per level on the
     # sequential critical path instead of two.
-    local_rot = local_array @ rotations
+    local_rot = _matmul4(local_array, rotations)
 
     eye4 = jnp.eye(4, dtype=jnp.float32)
     carry = jnp.zeros_like(local_array)
@@ -255,7 +270,7 @@ def _compute_fk_tf(
             eye4[None, :, :],
             carry[safe_parents],
         )
-        current = parent_transform @ local_rot[start:end]
+        current = _matmul4(parent_transform, local_rot[start:end])
         carry = carry.at[start:end].set(current)
 
     return carry
@@ -502,6 +517,8 @@ def solve_ik(
         )
 
 
+_COMPILER_OPTIONS = {"xla_cpu_experimental_ynn_fusion_type": ""}
+
 # Hard constraints are checked every _CHECK_EVERY steps (and on the result);
 # a failed check bisects back towards the last feasible checkpoint, at most
 # _MAX_BISECT halvings deep
@@ -516,6 +533,7 @@ _SLIDE_PUSH = 0.25
 
 @partial(
     jax.jit,
+    compiler_options=_COMPILER_OPTIONS,
     static_argnums=(
         5,  # fksolver
         6,  # threshold

@@ -41,7 +41,9 @@ from jax_ik.objectives import ObjectiveFunction
 _SQRT3_2 = float(np.sqrt(3.0) / 2.0)
 _VIOLATION_TOL = 1e-6
 # Bump when the proxy format changes so stale caches are rebuilt
-_CACHE_VERSION = 5
+_CACHE_VERSION = 8
+# Consecutive chunks of a link grouped together for the coarse broad phase
+_GROUP = 8
 
 
 class LinkProxy:
@@ -278,14 +280,44 @@ class CollisionModel:
         self.chunk_center = np.asarray(chunk_c, np.float32)
         self.chunk_radius = np.asarray(chunk_r, np.float32)
 
-        # One entry per (chunk, other link) to look up, per pair and direction
+        # Groups of up to _GROUP consecutive chunks of a link. Consecutive
+        # chunks are neighbours in the k-d split, so a group is compact; its
+        # sphere encloses its chunks' spheres
+        group_link, group_center, group_radius, group_chunks = [], [], [], []
+        for i in range(L):
+            ks = np.nonzero(self.chunk_link == i)[0]
+            for s in range(0, len(ks), _GROUP):
+                members = ks[s : s + _GROUP]
+                c, r = self.chunk_center[members], self.chunk_radius[members]
+                center = 0.5 * ((c - r[:, None]).min(0) + (c + r[:, None]).max(0))
+                group_link.append(i)
+                group_center.append(center)
+                group_radius.append(float((np.linalg.norm(c - center, axis=1) + r).max()))
+                group_chunks.append(members)
+        self.group_link = np.asarray(group_link, np.int32)
+        self.group_center = np.asarray(group_center, np.float32)
+        self.group_radius = np.asarray(group_radius, np.float32)
+
+        # One entry per (chunk, other link) to look up, per pair and
+        # direction, and one group entry per (group, other link) covering
+        # the entries of its chunks (padded with -1)
         e_chunk, e_target, e_pair = [], [], []
+        ge_group, ge_target, ge_entries = [], [], []
         for p, (a, b) in enumerate(self.pairs):
             for src, dst in ((a, b), (b, a)):
-                for k in np.nonzero(self.chunk_link == src)[0]:
-                    e_chunk.append(k)
-                    e_target.append(dst)
-                    e_pair.append(p)
+                for g in np.nonzero(self.group_link == src)[0]:
+                    ids = list(range(len(e_chunk), len(e_chunk) + len(group_chunks[g])))
+                    for k in group_chunks[g]:
+                        e_chunk.append(k)
+                        e_target.append(dst)
+                        e_pair.append(p)
+                    ge_group.append(g)
+                    ge_target.append(dst)
+                    ge_entries.append(ids + [-1] * (_GROUP - len(ids)))
+        self.ge_group = np.asarray(ge_group, np.int32)
+        self.ge_target = np.asarray(ge_target, np.int32)
+        self.ge_entries = np.asarray(ge_entries, np.int32).reshape(-1, _GROUP)
+        self.n_group_entries = len(ge_group)
         self.e_chunk = np.asarray(e_chunk, np.int32)
         self.e_target = np.asarray(e_target, np.int32)
         self.e_pair = np.asarray(e_pair, np.int32)
@@ -357,35 +389,50 @@ class CollisionModel:
         """Soft penalty for one pose from the `max_checks` closest entries:
         the same value as evaluate(...)[1] with that budget, with its
         gradient worked out alongside instead of by autodiff (much fewer
-        small ops per solver step)."""
+        small ops per solver step).
+
+        `fk` may also be a batch of poses (F, N, 4, 4); the budget is then
+        shared by all of them, so the lookups go to whichever poses are
+        actually close to a collision instead of max_checks per pose."""
         if not self.pairs:
             return jnp.float32(0.0)
         bone_idx = np.asarray([fk_solver.bone_names.index(n) for n in self.link_names])
-        Ts = fk[bone_idx]
-        return _penalty(self, min(max_checks, self.n_entries), Ts, jnp.asarray(margin, jnp.float32))
+        Ts = fk[..., bone_idx, :, :]
+        batched = Ts.ndim == 4
+        Ts = Ts if batched else Ts[None]
+        k = min(max_checks, self.n_entries * Ts.shape[0])
+        return _penalty(self, k, Ts, jnp.asarray(margin, jnp.float32))
 
     def _penalty_and_grad(self, Ts, margin, k):
-        """(penalty, d penalty / d Ts) from the k entries with the smallest gap."""
-        gap = self._gaps(Ts)
+        """(penalty, d penalty / d Ts) from about the k entries with the
+        smallest gap over all poses of Ts (F, L, 4, 4)."""
+        F, L = Ts.shape[:2]
+        group_gap = self._group_gaps(Ts)  # (F * GE,)
+        Ts = Ts.reshape(F * L, 4, 4)
 
         def narrow(_):
-            _, sel = jax.lax.top_k(-gap, k)
+            frame, sel, valid = self._select(Ts, group_gap, F, k)
             links = jnp.asarray(self.e_links)[sel]
-            src, dst = links[:, 0], links[:, 1]
+            dst = links[:, 1]
+            # Rows of the flattened (F * L) transforms
+            src_row, dst_row = frame * L + links[:, 0], frame * L + dst
             R, t = Ts[:, :3, :3], Ts[:, :3, 3]
-            Rs, Rd = R[src], R[dst] / self.spacing
-            ts, td = t[src], t[dst]
+            Rs, Rd = R[src_row], R[dst_row] / self.spacing
+            ts, td = t[src_row], t[dst_row]
             A = jnp.einsum("kji,kjl->kil", Rd, Rs)
             b = jnp.einsum("kji,kj->ki", Rd, ts - td) - jnp.asarray(self.origins / self.spacing)[dst]
             pts = jnp.asarray(self.e_points)[sel]
             coords = jnp.einsum("kij,kmj->kmi", A, pts) + b[:, None, :]
             d = self._trilinear(dst, coords) - jnp.asarray(self.e_radii)[sel]
             d_min = jnp.min(d, axis=1)
-            # The min only has a gradient at each entry's deepest point
-            j = jnp.argmin(d, axis=1)[:, None, None]
+            # The min only has a gradient at each entry's deepest point. Its
+            # index as a plain min over the matching ones: same as argmin,
+            # but argmin's value-and-index reduction is much slower on CPU
+            m = jnp.arange(d.shape[1], dtype=jnp.int32)
+            j = jnp.min(jnp.where(d == d_min[:, None], m, d.shape[1]), axis=1)[:, None, None]
             p = jnp.take_along_axis(pts, j, axis=1)[:, 0]
             _, g = self._trilinear(dst, jnp.take_along_axis(coords, j, axis=1), with_slope=True)
-            depth = jax.nn.relu(margin - d_min)
+            depth = jnp.where(valid, jax.nn.relu(margin - d_min), 0.0)
             # Chain rule for d = grid(Rd^T (Rs p + ts - td) / spacing - origin)
             # with slope g, scaled by d penalty / d d
             g = -2.0 * depth[:, None] * g[:, 0]
@@ -396,15 +443,63 @@ class CollisionModel:
                 [u[:, :, None] * g[:, None, :] / self.spacing, -n[:, :, None]], 2
             )
             # Scatter onto the links as one matmul: (L, k) @ (k, 12)
-            onehot = jax.nn.one_hot(jnp.concatenate([src, dst]), Ts.shape[0], dtype=Ts.dtype)
+            onehot = jax.nn.one_hot(jnp.concatenate([src_row, dst_row]), F * L, dtype=Ts.dtype)
             G = (onehot.T @ jnp.concatenate([Gs, Gd]).reshape(2 * k, 12)).reshape(-1, 3, 4)
             G = jnp.concatenate([G, jnp.zeros((G.shape[0], 1, 4), G.dtype)], 1)
-            return jnp.sum(depth**2), G
+            return jnp.sum(depth**2), G.reshape(F, L, 4, 4)
 
         # Nothing within the margin: no penalty, no gradient
         return jax.lax.cond(
-            jnp.min(gap) < margin, narrow, lambda _: (jnp.float32(0.0), jnp.zeros_like(Ts)), None
+            jnp.min(group_gap) < margin, narrow, lambda _: (jnp.float32(0.0), jnp.zeros((F, L, 4, 4), Ts.dtype)), None
         )
+
+    def _group_gaps(self, Ts):
+        """Coarse broad phase over poses Ts (F, L, 4, 4): per group entry a
+        lower bound on the gaps of its entries, (F * GE,)."""
+        R, t = Ts[..., :3, :3], Ts[..., :3, 3]
+        gl = jnp.asarray(self.group_link)
+        gc = jnp.einsum("fgij,gj->fgi", R[:, gl], self.group_center) + t[:, gl]
+        bc = jnp.einsum("flij,lnj->flni", R, self.bound_centers) + t[:, :, None, :]
+        bc = bc.reshape(bc.shape[0], -1, 3)
+        # Groups x spheres are few enough that the plain differences are
+        # cheap, no need for the matmul form of _gaps
+        d2 = jnp.sum(jnp.square(gc[:, :, None, :] - bc[:, None, :, :]), -1)
+        d2 = d2.reshape(*gc.shape[:2], *self.bound_radii.shape)
+        dist = jnp.sqrt(d2 + 1e-12) - self.bound_radii
+        group_gap = jnp.min(dist, axis=-1) - self.group_radius[:, None]  # (F, G, L)
+        return (group_gap[:, self.ge_group, self.ge_target] - self.gap_slack).reshape(-1)
+
+    def _select(self, Ts, group_gap, F, k):
+        """(frame, entry, valid) of the k entries with the smallest gap
+        among the entries of the closest group entries; Ts is (F * L, 4, 4).
+
+        Entries are only looked at inside the k group entries with the
+        smallest bound. Each of the k closest entries has a group bound no
+        larger than its gap, so this only misses one of them when more than
+        k groups have a bound below it, i.e. only among close entries."""
+        L = Ts.shape[0] // F
+        q = min(k, group_gap.shape[0])
+        _, gsel = jax.lax.top_k(-group_gap, q)
+        frame, ge = jnp.divmod(gsel, self.n_group_entries)
+        ent = jnp.asarray(self.ge_entries)[ge]  # (q, _GROUP)
+        valid = ent >= 0
+        ent = jnp.maximum(ent, 0)
+        chunk = jnp.asarray(self.e_chunk)[ent]
+        src = frame[:, None] * L + jnp.asarray(self.chunk_link)[chunk]
+        dst_link = jnp.asarray(self.e_target)[ent]
+        dst = frame[:, None] * L + dst_link
+        R, t = Ts[:, :3, :3], Ts[:, :3, 3]
+        cc = jnp.einsum("qgij,qgj->qgi", R[src], jnp.asarray(self.chunk_center)[chunk]) + t[src]
+        bc = jnp.einsum("qgij,qgnj->qgni", R[dst], jnp.asarray(self.bound_centers)[dst_link])
+        bc = bc + t[dst][:, :, None, :]
+        dist = jnp.sqrt(jnp.sum(jnp.square(cc[:, :, None] - bc), -1) + 1e-12)
+        dist = dist - jnp.asarray(self.bound_radii)[dst_link]
+        gap = jnp.min(dist, -1) - jnp.asarray(self.chunk_radius)[chunk] - self.gap_slack
+        gap = jnp.where(valid, gap, jnp.inf).reshape(-1)
+        k = min(k, gap.shape[0])
+        _, sel = jax.lax.top_k(-gap, k)
+        frame = jnp.repeat(frame, _GROUP)[sel]
+        return frame, ent.reshape(-1)[sel], valid.reshape(-1)[sel]
 
     def _gaps(self, Ts):
         """Broad-phase lower bound per entry: every chunk sphere against
@@ -752,6 +847,15 @@ def _pairs_to_keep(model, fk_solver, poses, threshold):
 # --- objective --------------------------------------------------------------
 
 
+# Default exact lookups per frame for the soft penalty of a trajectory, see
+# SelfCollisionObj.trajectory_checks. Swept as the least that keeps soft
+# trajectories as clear and smooth as checking every frame on its own. Hard
+# mode keeps penalty_checks per frame: its penalty reaches much further, and
+# with fewer lookups it no longer keeps the motion between the checked
+# substeps clear of the margin
+TRAJECTORY_CHECKS_PER_FRAME = 16
+
+
 @register_pytree_node_class
 class SelfCollisionObj(ObjectiveFunction):
     """Keeps the model's links from intersecting each other.
@@ -779,6 +883,10 @@ class SelfCollisionObj(ObjectiveFunction):
         substeps: Interpolated poses checked between frames (hard mode).
         penalty_checks: Exact lookups used for the penalty per pose; the
             hard check always uses the model's full amount.
+        trajectory_checks: Exact lookups used for the penalty of a whole
+            trajectory, shared by its frames, so they go to the frames that
+            are close to a collision (default per frame:
+            TRAJECTORY_CHECKS_PER_FRAME soft, penalty_checks hard).
     """
 
     def __init__(
@@ -790,6 +898,7 @@ class SelfCollisionObj(ObjectiveFunction):
         influence=0.02,
         substeps=2,
         penalty_checks=32,
+        trajectory_checks=None,
     ):
         self.model = model
         self.margin = np.asarray(margin, np.float32)
@@ -804,6 +913,7 @@ class SelfCollisionObj(ObjectiveFunction):
         # The penalty only steers (hard mode) or trades off (soft mode), so
         # it looks at the closest entries only; the hard check is exact
         self.penalty_checks = int(penalty_checks)
+        self.trajectory_checks = trajectory_checks
 
     @property
     def is_hard_constraint(self):
@@ -822,10 +932,11 @@ class SelfCollisionObj(ObjectiveFunction):
             "influence": self.influence,
             "substeps": self.substeps,
             "penalty_checks": self.penalty_checks,
+            "trajectory_checks": self.trajectory_checks,
         }
 
     def update_params(self, params):
-        for key in ("model", "hard", "substeps", "penalty_checks"):
+        for key in ("model", "hard", "substeps", "penalty_checks", "trajectory_checks"):
             if key in params:
                 setattr(self, key, params[key])
         for key in ("margin", "weight", "influence"):
@@ -852,10 +963,17 @@ class SelfCollisionObj(ObjectiveFunction):
         # Frame 0 of a trajectory is always the fixed start pose: its
         # penalty is a constant
         X = X[None] if X.ndim == 1 else (X[1:] if X.shape[0] > 1 else X)
-        # lax.map, not vmap: under vmap the narrow-phase size switch would
-        # turn into computing every size for every frame
-        penalty = jax.lax.map(lambda cfg: self._penalty(cfg, fk_solver, reach), X)
-        return jnp.mean(penalty) * self.weight
+        if X.shape[0] == 1:
+            return self._penalty(X[0], fk_solver, reach) * self.weight
+        # All frames share one budget of exact lookups: usually only a few
+        # of them are anywhere near a collision, and those get the lookups
+        checks = self.trajectory_checks
+        if checks is None:
+            per_frame = self.penalty_checks if self.hard else TRAJECTORY_CHECKS_PER_FRAME
+            checks = per_frame * X.shape[0]
+        fk = jax.vmap(fk_solver.compute_fk_from_angles)(X)
+        penalty = self.model.penalty(fk, fk_solver, reach, int(checks))
+        return penalty / X.shape[0] * self.weight
 
     def check_poses(self, X):
         """Frames plus `substeps` interpolated poses between neighbours.

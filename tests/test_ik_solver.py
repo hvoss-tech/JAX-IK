@@ -1,8 +1,11 @@
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import PANDA_ARM
 
-from jax_ik.ik import InverseKinematicsSolver, solve_ik
+from jax_ik import ik
+from jax_ik.ik import InverseKinematicsSolver, _matmul4, solve_ik
 from jax_ik.objectives import (
     BoneZeroRotationObj,
     CombinedDerivativeObj,
@@ -230,6 +233,60 @@ def test_solve_ik_default_mask_only_frees_last_frame(tiny_solver):
     )
     best = np.asarray(best)
     assert np.allclose(best[:2], 0) and not np.allclose(best[2], 0)
+
+
+def test_solver_is_compiled_without_library_fusions(panda_urdf, monkeypatch):
+    # Tiny reductions and matmuls handed to YNNPACK cost far more per step
+    # than the arithmetic, so the solver loop is compiled without them
+    from jax_ik.collision import CollisionModel, SelfCollisionObj
+
+    solver = InverseKinematicsSolver(
+        panda_urdf, controlled_bones=PANDA_ARM, num_steps=5, compute_sdf=False
+    )
+    model = CollisionModel.cached(
+        solver.fk_solver, lower=solver.lower_bounds, upper=solver.upper_bounds
+    )
+    calls = []
+    core = ik._solve_ik_core
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return core(*args, **kwargs)
+
+    monkeypatch.setattr(ik, "_solve_ik_core", spy)
+    solver.solve(
+        mandatory_objective_functions=[DistanceObjTraj("panda_hand_tcp", [[0.3, -0.5, 0.3]], True)],
+        optional_objective_functions=[SelfCollisionObj(model)],
+        ik_points=3,
+        verbose=False,
+    )
+    args, kwargs = calls[0]
+    assert "ynn_fusion" not in core.lower(*args, **kwargs).compile().as_text()
+
+
+# --- FK ------------------------------------------------------------------------
+
+
+def test_matmul4_matches_matmul():
+    rng = np.random.default_rng(0)
+    a = jnp.asarray(rng.normal(size=(5, 3, 4, 4)).astype(np.float32))
+    b = jnp.asarray(rng.normal(size=(3, 4, 4)).astype(np.float32))
+    assert np.allclose(_matmul4(a, b), a @ b, atol=1e-5)
+    # Gradients too, as the solver differentiates through FK
+    ga = jax.grad(lambda a, b: jnp.sum(jnp.sin(_matmul4(a, b))), argnums=(0, 1))(a, b)
+    gb = jax.grad(lambda a, b: jnp.sum(jnp.sin(a @ b)), argnums=(0, 1))(a, b)
+    for x, y in zip(ga, gb):
+        assert np.allclose(x, y, atol=1e-4)
+
+
+def test_vmapped_fk_matches_per_pose_fk(panda_urdf):
+    solver = InverseKinematicsSolver(panda_urdf, controlled_bones=PANDA_ARM, compute_sdf=False)
+    fk = solver.fk_solver
+    lo, hi = np.asarray(solver.lower_bounds), np.asarray(solver.upper_bounds)
+    Q = jnp.asarray(np.random.default_rng(2).uniform(lo, hi, (6, lo.size)).astype(np.float32))
+    batched = np.asarray(jax.vmap(fk.compute_fk_from_angles)(Q))
+    for q, T in zip(Q, batched):
+        assert np.allclose(T, np.asarray(fk.compute_fk_from_angles(q)), atol=1e-5)
 
 
 # --- FK pruning cache --------------------------------------------------------
