@@ -165,8 +165,9 @@ def test_skipped_entries_never_hide_collisions(panda):
     full.gap_slack = model.gap_slack
     lo, hi = np.asarray(solver.lower_bounds), np.asarray(solver.upper_bounds)
     Q = jnp.asarray(np.random.default_rng(1).uniform(lo, hi, (150, lo.size)).astype(np.float32))
-    a = np.asarray(jax.vmap(lambda q: model.clearances(q, fk, 0.0))(Q))
-    b = np.asarray(jax.vmap(lambda q: full.clearances(q, fk, 0.0))(Q))
+    # Chunked: the full check vmapped over all poses at once needs > 12 GB
+    a = np.asarray(jax.lax.map(lambda q: model.clearances(q, fk, 0.0), Q, batch_size=10))
+    b = np.asarray(jax.lax.map(lambda q: full.clearances(q, fk, 0.0), Q, batch_size=10))
     assert not np.any((a >= 0) & (b < 0))
 
 
