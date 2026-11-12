@@ -13,9 +13,10 @@ Two ways to use it:
 """
 
 import argparse
+import copy
 import pathlib
 import time
-from collections import deque
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
@@ -197,9 +198,15 @@ class TrajectoryPlanner:
         initial_angles: np.ndarray = None,
         seed: int = None,
         extra_objectives: list = None,
+        reach_map: "ReachMap" = None,
+        far: float = 0.3,
     ):
         self.solver = solver
         self.end_effectors = list(end_effectors)
+        # With a reach map, targets come from it: the `far` fraction of
+        # reachable, collision-free cells furthest from where the plan starts
+        self.reach_map = reach_map
+        self.far = far
         # Added to every plan, e.g. a SelfCollisionObj; may be swapped live
         self.extra_objectives = list(extra_objectives or [])
         self.ik_points = ik_points
@@ -220,11 +227,19 @@ class TrajectoryPlanner:
     def end_effector_positions(self, angles=None) -> list:
         return self._fk.end_effector_positions(self.pose if angles is None else angles)
 
-    def random_targets(self, spread: float = 0.6) -> list:
+    def random_targets(self, spread: float = 0.6, start=None) -> list:
         """End-effector positions of a random legal pose, so every target is
         reachable. `spread` is the fraction of each joint range (around its
         middle) to sample from.
+
+        With a reach map, a far away point from it instead, measured from
+        the end-effectors at `start` (default: the current pose).
         """
+        if self.reach_map is not None:
+            current = self.end_effector_positions(start)
+            targets = self.reach_map.pick(current, self._rng, self.far)
+            if targets is not None:
+                return targets
         mid = (self._lower + self._upper) / 2
         half = (self._upper - self._lower) / 2
         q = mid + self._rng.uniform(-spread, spread, mid.shape) * half
@@ -245,26 +260,167 @@ class TrajectoryPlanner:
     def solve_trajectory(self, start_pose, targets: list) -> tuple:
         """Like plan, but from `start_pose` and without changing the
         planner's state, so it can run in the background while the current
-        trajectory plays. Returns (trajectory, loss, steps, solve ms)."""
+        trajectory plays. Returns (trajectory, loss, steps, solve ms).
+
+        With a reach map, the solve starts from a guess that blends from
+        `start_pose` to a map pose reaching near the targets, which gets far
+        targets several times more often and faster than starting from a
+        standing pose."""
         start = time.perf_counter()
-        traj, loss, steps = self.solver.solve(
-            initial_rotations=np.asarray(start_pose, dtype=np.float32),
+        start_pose = np.asarray(start_pose, dtype=np.float32)
+        mandatory = [
+            DistanceObjTraj(
+                bone_name=name,
+                target_points=[np.asarray(target, dtype=np.float32)],
+                use_head=True,
+            )
+            for name, target in zip(self.end_effectors, targets)
+        ]
+        optional = [
+            CombinedDerivativeObj(max_order=3, weight=self.smoothing),
+            *self.extra_objectives,
+        ]
+        guess = self.initial_guess(start_pose, targets)
+        if guess is None:
+            traj, loss, steps = self.solver.solve(
+                initial_rotations=start_pose,
+                learning_rate=self.learning_rate,
+                mandatory_objective_functions=mandatory,
+                optional_objective_functions=optional,
+                ik_points=self.ik_points,
+                patience=self.patience,
+                verbose=False,
+            )
+        else:
+            traj, loss, steps = self.solver.solve_guess(
+                guess,
+                learning_rate=self.learning_rate,
+                mandatory_objective_functions=mandatory,
+                optional_objective_functions=optional,
+                patience=self.patience,
+            )
+        ms = (time.perf_counter() - start) * 1000.0
+        return np.asarray(traj, dtype=np.float32), loss, steps, ms
+
+    def initial_guess(self, start_pose, targets: list, candidates: int = 8):
+        """(ik_points + 1, D) blend from `start_pose` to the pose of one of
+        the `candidates` reach map samples closest to `targets`, or None
+        without a reach map. Collision objectives (the extra objectives with
+        a violation) must find nothing on the way: a hard constraint can't
+        always repair a guess that runs through a link or an obstacle. If
+        every blend collides there is no guess either."""
+        if self.reach_map is None:
+            return None
+        poses = self.reach_map.poses_near(targets, candidates)
+        if len(poses) == 0:
+            return None
+        start_pose = np.asarray(start_pose, dtype=np.float32)
+        t = np.linspace(0.0, 1.0, self.ik_points + 1, dtype=np.float32)[None, :, None]
+        guesses = start_pose + t * (poses[:, None] - start_pose)  # (K, T, D)
+        checks = tuple(o for o in self.extra_objectives if hasattr(o, "violation"))
+        if not checks:
+            return guesses[0]
+        clear = np.asarray(_guesses_clear(checks, jnp.asarray(guesses), self.solver.fk_solver))
+        return guesses[int(np.argmax(clear))] if clear.any() else None
+
+    def solve_end_pose(self, start_pose, targets: list) -> tuple:
+        """A single pose reaching `targets`, for planning trajectories
+        between known poses (solve_between). Starts from the reach map pose
+        closest to the targets, or `start_pose` without a reach map, and
+        keeps clear of collisions like a whole trajectory would. Returns
+        (pose, miss in meters, solve ms)."""
+        start = time.perf_counter()
+        guess = None
+        if self.reach_map is not None:
+            poses = self.reach_map.poses_near(targets, 1)
+            if len(poses):
+                guess = poses[0]
+        if guess is None:
+            guess = np.asarray(start_pose, dtype=np.float32)
+        guess = np.clip(guess, self._lower, self._upper).astype(np.float32)
+        mandatory = [
+            DistanceObjTraj(
+                bone_name=name,
+                target_points=[np.asarray(target, dtype=np.float32)],
+                use_head=True,
+            )
+            for name, target in zip(self.end_effectors, targets)
+        ]
+        pose, _, _ = self.solver.solve_guess(
+            guess[None, :],
             learning_rate=self.learning_rate,
-            mandatory_objective_functions=[
-                DistanceObjTraj(
-                    bone_name=name,
-                    target_points=[np.asarray(target, dtype=np.float32)],
-                    use_head=True,
-                )
-                for name, target in zip(self.end_effectors, targets)
-            ],
-            optional_objective_functions=[
-                CombinedDerivativeObj(max_order=3, weight=self.smoothing),
-                *self.extra_objectives,
-            ],
-            ik_points=self.ik_points,
+            mandatory_objective_functions=mandatory,
+            optional_objective_functions=list(self.extra_objectives),
+            prefix_len=0,
             patience=self.patience,
-            verbose=False,
+        )
+        pose = np.asarray(pose[0], dtype=np.float32)
+        reached = self.end_effector_positions(pose)
+        miss = max(float(np.linalg.norm(r - t)) for r, t in zip(reached, targets))
+        return pose, miss, (time.perf_counter() - start) * 1000.0
+
+    def path_guess(self, start_pose, end_pose, vias: int = 64, rng=None):
+        """(ik_points + 1, D) guess from `start_pose` to `end_pose`: the
+        straight blend if the collision objectives find nothing on it,
+        otherwise the shortest clear detour through one of `vias` free reach
+        map poses (picked with `rng`, default the planner's own). If every
+        one collides, the one colliding least, for the solver to repair."""
+        start_pose = np.asarray(start_pose, dtype=np.float32)
+        end_pose = np.asarray(end_pose, dtype=np.float32)
+        t = np.linspace(0.0, 1.0, self.ik_points + 1, dtype=np.float32)[:, None]
+        straight = start_pose + t * (end_pose - start_pose)
+        checks = tuple(o for o in self.extra_objectives if hasattr(o, "violation"))
+        if not checks:
+            return straight
+        candidates = [straight]
+        if self.reach_map is not None:
+            free = np.nonzero(self.reach_map.free())[0]
+            if len(free):
+                rng = self._rng if rng is None else rng
+                picked = rng.choice(free, size=min(vias, len(free)), replace=False)
+                # Two straight pieces through the via pose, evenly timed
+                knots = np.linspace(0.0, 2.0, self.ik_points + 1, dtype=np.float32)[:, None]
+                first = np.minimum(knots, 1.0)
+                second = np.maximum(knots - 1.0, 0.0)
+                for via in self.reach_map.poses[picked]:
+                    candidates.append(
+                        start_pose + first * (via - start_pose) + second * (end_pose - via)
+                    )
+        guesses = np.stack(candidates)
+        violation = np.asarray(
+            _guesses_violation(checks, jnp.asarray(guesses), self.solver.fk_solver)
+        )
+        clear = violation <= 0
+        if clear[0]:
+            return straight
+        if not clear.any():
+            return guesses[int(np.argmin(violation))]
+        length = np.abs(np.diff(guesses, axis=1)).sum(axis=(1, 2))
+        return guesses[int(np.argmin(np.where(clear, length, np.inf)))]
+
+    def trajectory_clear(self, traj: np.ndarray) -> bool:
+        """Whether the collision objectives find nothing on `traj`."""
+        checks = tuple(o for o in self.extra_objectives if hasattr(o, "violation"))
+        if not checks:
+            return True
+        traj = jnp.asarray(traj, dtype=jnp.float32)[None]
+        return bool(np.asarray(_guesses_clear(checks, traj, self.solver.fk_solver))[0])
+
+    def solve_between(self, guess: np.ndarray) -> tuple:
+        """Trajectory with the first and last frame of `guess` (from
+        path_guess) kept as they are, smoothed and kept clear of collisions
+        in between. Returns (trajectory, loss, steps, solve ms)."""
+        start = time.perf_counter()
+        optional = [
+            CombinedDerivativeObj(max_order=3, weight=self.smoothing),
+            *self.extra_objectives,
+        ]
+        traj, loss, steps = self.solver.solve_guess(
+            np.asarray(guess, dtype=np.float32),
+            learning_rate=self.learning_rate,
+            optional_objective_functions=optional,
+            patience=self.patience,
+            suffix_len=1,
         )
         ms = (time.perf_counter() - start) * 1000.0
         return np.asarray(traj, dtype=np.float32), loss, steps, ms
@@ -288,6 +444,177 @@ class TrajectoryPlanner:
         w = x - i
         self.pose = ((1 - w) * traj[i] + w * traj[i + 1]).astype(np.float32)
         return self.pose
+
+
+@partial(jax.jit, static_argnums=2)
+def _guesses_clear(objectives, guesses, fk_solver):
+    """(K,) whether each guess trajectory is free of violations."""
+
+    def clear(X):
+        return jnp.all(jnp.stack([jnp.max(o.violation(X, fk_solver)) for o in objectives]) <= 0)
+
+    return jax.vmap(clear)(guesses)
+
+
+@partial(jax.jit, static_argnums=2)
+def _guesses_violation(objectives, guesses, fk_solver):
+    """(K,) total violation along each guess trajectory."""
+
+    def total(X):
+        return sum(jnp.sum(o.violation(X, fk_solver)) for o in objectives)
+
+    return jax.vmap(total)(guesses)
+
+
+class ReachMap:
+    """End-effector positions the model can reach without colliding.
+
+    Built from forward kinematics of `samples` random legal poses, so every
+    point in it is reachable by construction and no IK has to be solved.
+    Each sample keeps its clearance to the model's own links and to every
+    obstacle of `collision` (a CollisionModes), so poses that collide are
+    filtered out, also as obstacles are switched on and off. Obstacles must
+    be cleared by an extra `clearance`, since the solver already starts
+    pushing away from them before the margin.
+
+    Targets are picked uniformly over the occupied cells of a grid
+    (`cell` meters) rather than over the samples, which bunch up where
+    many poses reach the same spot, and are interpolated towards a
+    collision-free neighbour so they don't repeat the same few points.
+
+    Obstacle clearances are computed once, for the obstacles' positions at
+    build time.
+    """
+
+    def __init__(
+        self,
+        solver: InverseKinematicsSolver,
+        end_effectors: list,
+        collision: "CollisionModes" = None,
+        samples: int = 16384,
+        cell: float = None,
+        clearance: float = 0.02,
+        seed: int = None,
+        batch: int = 4096,
+    ):
+        start = time.perf_counter()
+        fk_solver = solver.fk_solver
+        lower = np.asarray(solver.lower_bounds, np.float32)
+        upper = np.asarray(solver.upper_bounds, np.float32)
+        rng = np.random.default_rng(seed)
+        self.poses = rng.uniform(lower, upper, (samples, len(lower))).astype(np.float32)
+        self.collision = collision
+        self.clearance = float(clearance)
+        ee = [fk_solver.bone_names.index(name) for name in end_effectors]
+
+        model = None if collision is None else collision.model
+        obstacle = None if collision is None else collision.obstacle
+        if obstacle is not None:
+            # Every obstacle on: the switches are applied when picking
+            obstacle = copy.copy(obstacle)
+            obstacle.floor_on = np.ones((), np.float32)
+            obstacle.sphere_on = np.ones_like(collision.obstacle.sphere_on)
+        # Pairs further than this keep their cheap broad-phase bound
+        near = collision.margin if collision is not None else 0.0
+
+        def one(q):
+            fk = fk_solver.compute_fk_from_angles(q)
+            heads = jnp.stack([fk[i, :3, 3] for i in ee])
+            self_clear = jnp.float32(1e3)
+            if model is not None and model.pairs:
+                # A capped budget only underestimates clearances, which at
+                # worst drops a few reachable poses
+                self_clear = jnp.min(model.evaluate(fk, fk_solver, near, max_checks=64)[0])
+            if obstacle is None:
+                return heads, self_clear, jnp.zeros(0, jnp.float32)
+            return heads, self_clear, jnp.min(obstacle.clearances(q, fk_solver), axis=1)
+
+        run = jax.jit(jax.vmap(one))
+        heads, self_clear, obstacle_clear = [], [], []
+        for i in range(0, samples, batch):
+            chunk = self.poses[i : i + batch]
+            pad = batch - len(chunk)
+            # Same batch shape every time, so it compiles once
+            out = run(np.concatenate([chunk, np.repeat(chunk[-1:], pad, 0)]) if pad else chunk)
+            out = [np.asarray(o)[: len(chunk)] for o in out]
+            heads.append(out[0])
+            self_clear.append(out[1])
+            obstacle_clear.append(out[2])
+        self.positions = np.concatenate(heads)  # (N, E, 3)
+        self.self_clear = np.concatenate(self_clear)  # (N,)
+        self.obstacle_clear = np.concatenate(obstacle_clear)  # (N, obstacles)
+
+        flat = self.positions.reshape(len(self.positions), -1)
+        if cell is None:
+            # About 30 cells across the largest extent
+            cell = float(np.max(np.ptp(self.positions, axis=0))) / 30
+        self.cell = float(cell)
+        _, self._cells = np.unique(
+            np.floor(flat / self.cell).astype(np.int64), axis=0, return_inverse=True
+        )
+        self._cells = self._cells.reshape(-1)
+        self.build_ms = (time.perf_counter() - start) * 1000.0
+
+    def free(self) -> np.ndarray:
+        """(N,) mask of the samples clear of the model's own links by the
+        collision margin and of the obstacles that are switched on by
+        margin + clearance."""
+        if self.collision is None:
+            return np.ones(len(self.poses), bool)
+        ok = self.self_clear >= self.collision.margin
+        need = self.collision.margin + self.clearance
+        o = self.collision.obstacle
+        if o is not None:
+            on = np.concatenate([[o.floor_on], o.sphere_on]) > 0
+            ok &= np.all((self.obstacle_clear >= need) | ~on, axis=1)
+        return ok
+
+    def poses_near(self, targets: list, k: int = 8) -> np.ndarray:
+        """(<= k, D) poses of the free samples closest to `targets`."""
+        free = np.nonzero(self.free())[0]
+        flat = self.positions[free].reshape(len(free), -1)
+        targets = np.concatenate([np.asarray(t, np.float32).reshape(3) for t in targets])
+        dist = np.linalg.norm(flat - targets, axis=1)
+        k = min(k, len(free))
+        nearest = np.argpartition(dist, k - 1)[:k] if k else np.zeros(0, int)
+        return self.poses[free[nearest[np.argsort(dist[nearest])]]]
+
+    def pick(self, current: list, rng, far: float = 0.3, pool: np.ndarray = None) -> list:
+        """Targets (one point per end-effector) among the `far` fraction of
+        reachable cells furthest from the `current` end-effector positions.
+
+        `pool` (a mask over the samples) restricts which samples the target
+        is picked from; it is then interpolated towards a free sample in a
+        neighbouring cell, so it is reachable even if the pool sample's own
+        pose collides. Returns None if nothing fits.
+        """
+        free = self.free()
+        pool = free if pool is None else pool
+        flat = self.positions.reshape(len(self.positions), -1)
+        current = np.concatenate([np.asarray(c, np.float32).reshape(3) for c in current])
+        dist = np.linalg.norm(flat - current, axis=1)
+        if not pool.any() or not free.any():
+            return None
+        cutoff = np.quantile(dist[free], 1.0 - far) if far < 1.0 else 0.0
+        candidates = np.nonzero(pool & (dist >= cutoff))[0]
+        if len(candidates) == 0:
+            # Nothing that far away: take the furthest the pool has
+            candidates = np.nonzero(pool)[0]
+            candidates = candidates[dist[candidates] >= dist[candidates].max() - self.cell]
+        # Uniform over cells: weigh each sample by 1 / samples in its cell
+        counts = np.bincount(self._cells[candidates])
+        weights = 1.0 / counts[self._cells[candidates]]
+        free_idx = np.nonzero(free)[0]
+        for i in rng.choice(candidates, size=min(8, len(candidates)), p=weights / weights.sum()):
+            near = np.linalg.norm(flat[free_idx] - flat[i], axis=1)
+            partners = free_idx[(near <= 1.5 * self.cell) & (free_idx != i)]
+            if len(partners) == 0:
+                continue
+            j = rng.choice(partners)
+            w = rng.uniform()
+            target = (1 - w) * self.positions[i] + w * self.positions[j]
+            return [p.astype(np.float32) for p in target]
+        return None
 
 
 class CollisionModes:
@@ -358,6 +685,165 @@ class CollisionModes:
     @property
     def current(self):
         return self.objectives[self.mode]
+
+
+class PlanPipeline:
+    """Plans trajectories ahead in the background, one after the other.
+
+    Every trajectory starts where the previous one ends, so the poses they
+    end in are solved first: one at a time, but quickly (a single frame
+    each), with `candidates` different targets tried in parallel and the
+    first one within `max_miss` of its targets taken. The trajectories in
+    between only depend on the two poses at their ends, so all of them, up
+    to `buffer`, are solved in parallel. A trajectory the collision
+    objectives still find something on is solved again from another guess,
+    up to `attempts` times; then it is dropped together with the ones after
+    it (they start where it ends), and planning goes on from the end of the
+    one before. After `max_retries` failures in a row the next pose or
+    trajectory is taken anyway.
+    """
+
+    def __init__(
+        self,
+        planner: TrajectoryPlanner,
+        buffer: int = 2,
+        candidates: int = 1,
+        max_miss: float = None,
+        max_retries: int = 20,
+        workers: int = None,
+        attempts: int = 3,
+    ):
+        self.planner = planner
+        self.attempts = attempts
+        self.buffer = buffer
+        self.candidates = candidates
+        self.max_miss = max_miss
+        self.max_retries = max_retries
+        self._pool = ThreadPoolExecutor(max_workers=workers or buffer + candidates)
+        # Worker threads must not share the planner's generator
+        self._rng = np.random.default_rng(planner._rng.integers(2**32))
+        self._ahead, self._ending = [], []
+        # Until the first plan is done, one solve at a time: parallel
+        # first calls would all compile the same functions at once
+        self._warm = False
+        self.restart(planner.trajectory[-1])
+
+    def restart(self, start_pose):
+        """Drop everything planned and plan on from `start_pose`, e.g.
+        after the collision setup changed."""
+        self._drop(0)
+        self._start = np.asarray(start_pose, dtype=np.float32).copy()
+        self._retries = 0
+
+    def _drop(self, index: int):
+        """Drop the planned trajectories from `index` on and the end pose
+        solves following them."""
+        for slot in self._ahead[index:]:
+            slot["future"].cancel()
+        for future in self._ending:
+            future.cancel()
+        # Planned trajectories in playing order, each a dict with its
+        # targets, end pose and the future solving the way there
+        self._ahead = self._ahead[:index]
+        # End pose solves for the next trajectory after _ahead
+        self._ending = []
+
+    @property
+    def solving(self) -> int:
+        return sum(not slot["future"].done() for slot in self._ahead)
+
+    @property
+    def planned(self) -> int:
+        """Trajectories ready to play, in order."""
+        n = 0
+        for slot in self._ahead:
+            if not slot["usable"]:
+                break
+            n += 1
+        return n
+
+    def ready(self) -> bool:
+        return bool(self._ahead) and self._ahead[0]["usable"]
+
+    def pop(self) -> tuple:
+        """The next trajectory, as (targets, (trajectory, loss, steps,
+        solve ms)); the time includes solving its end pose."""
+        slot = self._ahead.pop(0)
+        (traj, loss, steps, ms), _ = slot["future"].result()
+        # Where planning goes on from if everything after it is dropped
+        self._start = slot["end"]
+        return slot["targets"], (traj, loss, steps, ms + slot["end_ms"])
+
+    def _end_pose(self, start, targets):
+        pose, miss, ms = self.planner.solve_end_pose(start, targets)
+        return targets, pose, miss, ms
+
+    def _between(self, start, end, seed):
+        planner = self.planner
+        guess = planner.path_guess(start, end, rng=np.random.default_rng(seed))
+        result = planner.solve_between(guess)
+        return result, planner.trajectory_clear(result[0])
+
+    def poll(self):
+        """Take in finished solves and keep the pipeline full."""
+        planner = self.planner
+        # Trajectories that still collide, dropped with everything after
+        for i, slot in enumerate(self._ahead):
+            if not slot["future"].done() or slot["usable"]:
+                continue
+            if slot["future"].result()[1] or self._retries >= self.max_retries:
+                slot["usable"] = self._warm = True
+                continue
+            if slot["attempts"] < self.attempts:
+                # Same end poses, so the plans after it stay valid
+                slot["attempts"] += 1
+                seed = self._rng.integers(2**32)
+                slot["future"] = self._pool.submit(self._between, slot["start"], slot["end"], seed)
+                continue
+            self._retries += 1
+            self._drop(i)
+            break
+        start = self._ahead[-1]["end"] if self._ahead else self._start
+        for future in self._ending:
+            if not future.done():
+                continue
+            targets, pose, miss, ms = future.result()
+            if (
+                self.max_miss is not None
+                and miss > self.max_miss
+                and self._retries < self.max_retries
+            ):
+                self._retries += 1
+                continue
+            self._retries = 0
+            seed = self._rng.integers(2**32)
+            self._ahead.append(
+                dict(
+                    targets=targets,
+                    start=start,
+                    end=pose,
+                    end_ms=ms,
+                    future=self._pool.submit(self._between, start, pose, seed),
+                    # Solved, and clear or out of retries
+                    usable=False,
+                    attempts=1,
+                )
+            )
+            # The other candidates started from where this one starts
+            for other in self._ending:
+                other.cancel()
+            self._ending = []
+            start = pose
+            break
+        self._ending = [f for f in self._ending if not f.done()]
+        if len(self._ahead) >= (self.buffer if self._warm else 1):
+            return
+        for _ in range((self.candidates if self._warm else 1) - len(self._ending)):
+            targets = planner.random_targets(start=start)
+            self._ending.append(self._pool.submit(self._end_pose, start, targets))
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 class RealtimeVisualizer:
@@ -600,6 +1086,45 @@ class RealtimeVisualizer:
         if self.collision is not None:
             self._update_collision(angles)
 
+    def look_down(self, elevation: float = 45.0, zoom_out: float = 1.0) -> None:
+        """Turn the camera around its focal point so it looks down at the
+        model from `elevation` degrees above the horizon, and move it
+        `zoom_out` times further away."""
+        cam = self.plotter.camera
+        focal = np.asarray(cam.focal_point, np.float64)
+        offset = np.asarray(cam.position, np.float64) - focal
+        up = np.asarray(cam.up, np.float64)
+        up /= np.linalg.norm(up)
+        horizontal = offset - (offset @ up) * up
+        if np.linalg.norm(horizontal) < 1e-9:
+            # Looking straight down: any horizontal direction will do
+            horizontal = np.cross(up, [1.0, 0.0, 0.0])
+            if np.linalg.norm(horizontal) < 1e-9:
+                horizontal = np.cross(up, [0.0, 0.0, 1.0])
+        horizontal /= np.linalg.norm(horizontal)
+        e = np.radians(elevation)
+        distance = np.linalg.norm(offset) * zoom_out
+        position = focal + distance * (np.cos(e) * horizontal + np.sin(e) * up)
+        self.plotter.camera_position = [tuple(position), tuple(focal), tuple(up)]
+
+    def orbit_around(self, bone: str) -> None:
+        """Dragging with the left mouse button turns the camera around the
+        vertical axis through `bone` (e.g. the base) and up and down, and
+        the view stays upright. The focal point moves onto that axis at the
+        height it had, and the camera moves along with it."""
+        cam = self.plotter.camera
+        up = np.asarray(cam.up, np.float64)
+        up /= np.linalg.norm(up)
+        _, heads = self.poser.pose(self._angles)
+        pivot = heads[self.fk_solver.bone_names.index(bone)].astype(np.float64)
+        focal = np.asarray(cam.focal_point, np.float64)
+        moved = pivot + ((focal - pivot) @ up) * up
+        position = np.asarray(cam.position, np.float64) + (moved - focal)
+        self.plotter.camera_position = [tuple(position), tuple(moved), tuple(up)]
+        if self.plotter.iren is not None:
+            # Azimuth turns around the view up, which terrain style keeps
+            self.plotter.enable_terrain_style()
+
     def set_status(self, text: str) -> None:
         self.status.set_text("upper_left", text)
 
@@ -696,29 +1221,32 @@ class RealtimeVisualizer:
     def run_trajectory(
         self,
         planner: TrajectoryPlanner,
-        interval: float = 5.0,
+        interval: float = None,
         playback: float = 2.0,
         fps: float = 60.0,
         max_miss: float = None,
         max_retries: int = 20,
         buffer: int = 2,
         candidates: int = 1,
+        workers: int = None,
     ) -> None:
-        """Blocking: every `interval` seconds pick new random reachable
+        """Blocking: every `interval` seconds (default: back to back, as
+        soon as the previous trajectory is done) pick new random reachable
         targets, plan a trajectory to them and play it back over `playback`
-        seconds. Trajectories are planned in the background, each starting
-        where the previous one ends, so up to `buffer` of them are ready to
-        play right away; if planning falls behind, the model waits.
-        `candidates` plans to different targets run in parallel for each
-        next one, and the first that is good enough is taken. Changing the
-        collision mode or obstacles drops the buffered ones. The planned
-        end-effector paths are drawn as lines.
+        seconds. Up to `buffer` trajectories are planned ahead in the
+        background, in parallel on `workers` threads (see PlanPipeline);
+        if planning falls behind, the model waits. `candidates` different
+        targets are tried in parallel for each next one, and the first that
+        is good enough is taken. Changing the collision mode or obstacles
+        drops the planned ones. The planned end-effector paths are drawn as
+        lines.
 
-        With `max_miss` (meters), a plan ending further than that from its
-        targets is dropped and new targets are planned instead, up to
-        `max_retries` times in a row (then the plan is used anyway).
+        With `max_miss` (meters), targets that can't be reached closer than
+        that are dropped and new ones picked instead, up to `max_retries`
+        times in a row (then they are used anyway).
         """
         pv = self.pv
+        interval = playback if interval is None else interval
         playback = min(playback, interval)
         radius = 0.012 * self.scale
         colors = ["red", "green", "orange", "purple", "cyan", "magenta"]
@@ -739,26 +1267,14 @@ class RealtimeVisualizer:
             )
             paths.append(path)
 
-        worker = ThreadPoolExecutor(max_workers=candidates)
-        state = {
-            "n": 0,
-            "dist": 0.0,
-            "since": None,
-            # Accepted plans waiting to be played, as (targets, solve result)
-            "queue": deque(),
-            # Plans being solved, as (future, slot): only those for the
-            # current slot (the next plan after the queue) can still be used
-            "pending": [],
-            "slot": 0,
-            "retries": 0,
-        }
+        pipeline = PlanPipeline(planner, buffer, candidates, max_miss, max_retries, workers)
+        state = {"n": 0, "dist": 0.0, "since": None}
 
         def flush():
             """Collision mode or obstacles changed: plans made for the old
-            setup are dropped and planning restarts from the current one."""
-            state["queue"].clear()
-            state["slot"] += 1
-            state["retries"] = 0
+            setup are dropped and planning restarts from the end of the
+            trajectory playing now."""
+            pipeline.restart(planner.trajectory[-1])
 
         if self.collision is not None:
             planner.extra_objectives = self.collision.current
@@ -773,48 +1289,6 @@ class RealtimeVisualizer:
         def miss(targets, traj):
             final = planner.end_effector_paths(traj[-1:])
             return max(np.linalg.norm(f[0] - t) for f, t in zip(final, targets))
-
-        def chain_start():
-            """Where the next plan starts: the end of the last buffered plan,
-            or of the one playing."""
-            queue = state["queue"]
-            return (queue[-1][1][0] if queue else planner.trajectory)[-1].copy()
-
-        def keep_planning():
-            """Collect finished background plans: the first one for the
-            current slot that reaches its targets joins the queue, the rest
-            are dropped. Then keep `candidates` plans (different targets
-            from the same start) running while the buffer isn't full."""
-            running = []
-            for future, slot in state["pending"]:
-                if not future.done():
-                    running.append((future, slot))
-                    continue
-                if slot != state["slot"]:
-                    continue
-                targets, result = future.result()
-                missed = (
-                    max_miss is not None
-                    and state["retries"] < max_retries
-                    and miss(targets, result[0]) > max_miss
-                )
-                if missed:
-                    state["retries"] += 1
-                else:
-                    state["retries"] = 0
-                    state["queue"].append((targets, result))
-                    state["slot"] += 1
-            state["pending"] = running
-            if len(state["queue"]) >= buffer:
-                return
-            start = chain_start()
-            current = sum(slot == state["slot"] for _, slot in running)
-            for _ in range(candidates - current):
-                targets = planner.random_targets()
-                future = worker.submit(
-                    lambda targets=targets: (targets, planner.solve_trajectory(start, targets))
-                )
-                state["pending"].append((future, state["slot"]))
 
         def install(plan):
             targets, (traj, loss, steps, ms) = plan
@@ -832,11 +1306,11 @@ class RealtimeVisualizer:
             state.update(since=time.perf_counter(), n=state["n"] + 1, dist=miss(targets, traj))
 
         def tick(_step=None):
-            keep_planning()
+            pipeline.poll()
             elapsed = time.perf_counter() - state["since"]
-            if elapsed >= interval and state["queue"]:
-                install(state["queue"].popleft())
-                keep_planning()
+            if elapsed >= interval and pipeline.ready():
+                install(pipeline.pop())
+                pipeline.poll()
                 elapsed = 0.0
             u = elapsed / playback if playback > 0 else 1.0
             self.set_pose(planner.sample(u))
@@ -844,7 +1318,7 @@ class RealtimeVisualizer:
             self.set_status(
                 f"target #{state['n']}   "
                 + ("planning the next trajectory..." if waiting else f"next in {interval - elapsed:.1f}s")
-                + f"   {len(state['queue'])} planned ahead"
+                + f"   {pipeline.planned} planned ahead, {pipeline.solving} solving"
                 + f"\n{planner.ik_points} trajectory points, smoothing {planner.smoothing}, "
                 f"frame {min(u, 1.0) * planner.ik_points:.1f}/{planner.ik_points}\n"
                 f"solved in {planner.solve_ms:.0f} ms ({planner.steps} steps), "
@@ -853,16 +1327,16 @@ class RealtimeVisualizer:
             self.plotter.render()
 
         print("Compiling IK solver...")
-        while not state["queue"]:
-            keep_planning()
+        while not pipeline.ready():
+            pipeline.poll()
             time.sleep(0.01)
-        install(state["queue"].popleft())
+        install(pipeline.pop())
         tick()
         self.plotter.add_timer_event(
             max_steps=2**31 - 1, duration=max(1, int(1000 / fps)), callback=tick
         )
         self.plotter.show()
-        worker.shutdown(wait=False, cancel_futures=True)
+        pipeline.shutdown()
 
 
 def _smplx_preset(fk_solver: FKSolver, hand: str):

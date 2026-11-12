@@ -165,6 +165,24 @@ def test_solve_guess_keeps_prefix_frames(tiny_solver):
     assert not np.allclose(result[2:], guess[2:])
 
 
+def test_solve_guess_keeps_suffix_frames(tiny_solver):
+    guess = np.zeros((5, 9), np.float32)
+    guess[0, 0] = 0.4
+    guess[-1, 3] = -0.6
+    result, _, _ = tiny_solver.solve_guess(
+        guess,
+        learning_rate=0.05,
+        optional_objective_functions=[CombinedDerivativeObj(max_order=2, weight=1.0)],
+        suffix_len=1,
+    )
+    assert np.allclose(result[0], guess[0])
+    assert np.allclose(result[-1], guess[-1])
+    # Smoothing moves the frames in between towards the fixed ends
+    assert not np.allclose(result[1:-1], guess[1:-1])
+    with pytest.raises(ValueError):
+        tiny_solver.solve_guess(guess[:2], prefix_len=1, suffix_len=1)
+
+
 def test_optional_only_solve(tiny_solver):
     start = np.full(9, 0.1, np.float32)
     start = np.clip(start, tiny_solver.lower_bounds, tiny_solver.upper_bounds)

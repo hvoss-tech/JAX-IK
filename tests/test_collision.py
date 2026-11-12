@@ -516,3 +516,68 @@ def test_panda_hard_solve_never_collides(panda):
         )
         assert float(np.sum(obj.violation(jnp.asarray(result), fk))) == 0.0
         assert float(clear(result[-1]).min()) >= 0.005 - 1e-5
+
+
+# --- reach map -----------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def panda_reach(panda):
+    from jax_ik.visualizer import CollisionModes, ReachMap
+
+    solver, model = panda
+    obstacles = dict(floor=-1.0, spheres=[((0.35, -0.55, 0.35), 0.1)], ignore_links=("panda_link0",))
+    modes = CollisionModes(model, margin=0.005, mode="hard", obstacles=obstacles)
+    reach = ReachMap(solver, ["panda_hand_tcp"], collision=modes, samples=4096, seed=0)
+    return solver, model, modes, reach
+
+
+def test_reach_map_keeps_only_collision_free_poses(panda_reach):
+    solver, model, modes, reach = panda_reach
+    fk = solver.fk_solver
+    clear = jax.jit(lambda q: model.clearances(q, fk).min())
+    obstacle = jax.jit(lambda q: jnp.min(modes.obstacle.clearances(q, fk, checks=4096), axis=1))
+    free = np.nonzero(reach.free())[0]
+    assert 0 < len(free) < len(reach.poses)
+    for i in free[:: max(1, len(free) // 40)]:
+        assert float(clear(reach.poses[i])) >= 0.005 - 1e-5
+        assert float(obstacle(reach.poses[i]).min()) >= 0.005 + reach.clearance - 1e-5
+    # Some dropped poses really collide with the arm itself
+    assert (reach.self_clear < 0).any()
+
+
+def test_reach_map_follows_obstacle_switches(panda_reach):
+    _, _, modes, reach = panda_reach
+    both = reach.free()
+    sphere_blocked = reach.obstacle_clear[:, 1] < 0.005 + reach.clearance
+    assert not (both & sphere_blocked).any()
+    modes.toggle_obstacle(1)  # sphere off
+    try:
+        without = reach.free()
+        assert (without & sphere_blocked).any()
+        assert np.array_equal(without & ~sphere_blocked, both)
+    finally:
+        modes.toggle_obstacle(1)
+    assert np.array_equal(reach.free(), both)
+
+
+def test_reach_map_guess_never_runs_through_a_collision(panda_reach):
+    from jax_ik.visualizer import TrajectoryPlanner
+
+    solver, _, modes, reach = panda_reach
+    mid = (np.asarray(solver.lower_bounds) + np.asarray(solver.upper_bounds)) / 2
+    planner = TrajectoryPlanner(
+        solver, ["panda_hand_tcp"], initial_angles=mid, seed=1, reach_map=reach
+    )
+    planner.extra_objectives = modes.current
+    found = 0
+    for _ in range(10):
+        targets = planner.random_targets()
+        guess = planner.initial_guess(planner.pose, targets)
+        if guess is None:
+            continue
+        found += 1
+        X = jnp.asarray(guess)
+        for obj in modes.current:
+            assert float(jnp.max(obj.violation(X, solver.fk_solver))) <= 0.0
+    assert found > 0

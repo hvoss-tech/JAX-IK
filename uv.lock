@@ -583,7 +583,7 @@ wheels = [
 
 [[package]]
 name = "jax-ik"
-version = "0.3"
+version = "0.4"
 source = { editable = "." }
 dependencies = [
     { name = "configargparse" },

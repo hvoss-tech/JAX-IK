@@ -1502,26 +1502,36 @@ class InverseKinematicsSolver:
         optional_objective_functions: tuple = (),
         prefix_len: int = 1,
         patience: int = 200,
+        suffix_len: int = 0,
     ) -> tuple:
         """
-        Solve IK for a trajectory, keeping the first prefix_len frames fixed.
+        Solve IK for a trajectory, keeping the first prefix_len and the last
+        suffix_len frames fixed.
 
         Args:
             initial_rotations (np.ndarray): Initial joint angle trajectory.
             learning_rate (float): Adam optimizer learning rate.
             mandatory_objective_functions (tuple): Mandatory objectives.
             optional_objective_functions (tuple): Optional objectives.
-            prefix_len (int): Number of frames to keep fixed.
+            prefix_len (int): Number of leading frames to keep fixed.
             patience (int): Early stopping patience.
+            suffix_len (int): Number of trailing frames to keep fixed.
 
         Returns:
             tuple: (final_angles, best_loss, steps)
         """
         X_full = jnp.asarray(initial_rotations, dtype=jnp.float32)
+        free = X_full.shape[0] - prefix_len - suffix_len
+        if free < 1:
+            raise ValueError(
+                f"Nothing left to solve: {X_full.shape[0]} frames, "
+                f"{prefix_len} fixed at the start and {suffix_len} at the end"
+            )
         mask = jnp.concatenate(
             [
                 jnp.zeros(prefix_len, dtype=bool),
-                jnp.ones(X_full.shape[0] - prefix_len, dtype=bool),
+                jnp.ones(free, dtype=bool),
+                jnp.zeros(suffix_len, dtype=bool),
             ]
         )
 
